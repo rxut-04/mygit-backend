@@ -1,0 +1,9 @@
+target/
+.mvn/
+data/
+*.tmp
+.git/
+.gitignore
+HELP.md
+mvnw
+mvnw.cmd
