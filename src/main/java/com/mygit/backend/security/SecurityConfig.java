@@ -35,6 +35,7 @@ public class SecurityConfig {
                         .requestMatchers("/h2-console/**").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/refs", "/api/repos/*/*/refs").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/objects/**", "/api/repos/*/*/objects/**").permitAll()
+                        .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/files", "/api/repos/*/*/files").permitAll()
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)

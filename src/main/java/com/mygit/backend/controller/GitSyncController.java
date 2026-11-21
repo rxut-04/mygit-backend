@@ -4,9 +4,11 @@ import com.mygit.backend.dto.PushPayload;
 import com.mygit.backend.model.GitObject;
 import com.mygit.backend.model.GitRef;
 import com.mygit.backend.model.Repository;
+import com.mygit.backend.model.RepositoryFile;
 import com.mygit.backend.model.User;
 import com.mygit.backend.repository.GitObjectRepository;
 import com.mygit.backend.repository.GitRefRepository;
+import com.mygit.backend.repository.RepositoryFileRepository;
 import com.mygit.backend.repository.RepositoryRepository;
 import com.mygit.backend.repository.UserRepository;
 import com.mygit.backend.security.CustomUser;
@@ -38,6 +40,9 @@ public class GitSyncController {
 
     @Autowired
     private GitObjectRepository gitObjects;
+
+    @Autowired
+    private RepositoryFileRepository repoFiles;
 
     private String cleanRepoName(String name) {
         if (name == null) return "";
@@ -153,7 +158,49 @@ public class GitSyncController {
             }
         }
 
-        // 2. Update the target reference
+        // 2. Ingest file metadata and code into dedicated repository_files table
+        if (payload.files() != null && !payload.files().isEmpty()) {
+            String branch = (payload.ref() != null && payload.ref().startsWith("refs/heads/"))
+                    ? payload.ref().substring("refs/heads/".length())
+                    : "main";
+            String commitSha = payload.target_sha() != null ? payload.target_sha() : "";
+
+            User uploader = users.findById(principal.getId()).orElse(null);
+
+            for (PushPayload.PushedFile pf : payload.files()) {
+                String path = pf.path();
+                if (path == null || path.isBlank()) continue;
+                String fileName = path.contains("/") ? path.substring(path.lastIndexOf('/') + 1) : path;
+                String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.') + 1) : "";
+
+                RepositoryFile repoFile = repoFiles
+                        .findByRepositoryIdAndBranchNameAndFilePath(repo.getId(), branch, path)
+                        .orElse(new RepositoryFile(
+                                repo,
+                                branch,
+                                path,
+                                fileName,
+                                ext,
+                                pf.size() != null ? pf.size() : 0L,
+                                commitSha,
+                                pf.blob_sha() != null ? pf.blob_sha() : "",
+                                pf.content_text(),
+                                null,
+                                Boolean.TRUE.equals(pf.is_binary()),
+                                uploader
+                        ));
+
+                repoFile.setCommitSha(commitSha);
+                if (pf.blob_sha() != null) repoFile.setBlobSha(pf.blob_sha());
+                if (pf.size() != null) repoFile.setFileSize(pf.size());
+                if (pf.content_text() != null) repoFile.setContentText(pf.content_text());
+                repoFile.setBinary(Boolean.TRUE.equals(pf.is_binary()));
+
+                repoFiles.save(repoFile);
+            }
+        }
+
+        // 3. Update the target reference
         if (payload.ref() != null && payload.target_sha() != null) {
             GitRef ref = gitRefs.findByRepositoryIdAndRefName(repo.getId(), payload.ref())
                     .orElse(new GitRef(repo, payload.ref(), payload.target_sha()));
@@ -166,6 +213,41 @@ public class GitSyncController {
                 "ref", payload.ref() != null ? payload.ref() : "",
                 "sha", payload.target_sha() != null ? payload.target_sha() : ""
         ));
+    }
+
+    /**
+     * Endpoint to fetch the dynamic file tree and source code from repository_files table.
+     */
+    @Transactional(readOnly = true)
+    @GetMapping(value = {
+            "/api/repos/{repoName}/files",
+            "/api/repos/{owner}/{repoName}/files"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> getRepositoryFiles(
+            @PathVariable String repoName,
+            @PathVariable(required = false) String owner,
+            @RequestParam(defaultValue = "main") String branch,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        Repository repo = resolveRepository(repoName, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+
+        List<RepositoryFile> list = repoFiles.findByRepositoryIdAndBranchName(repo.getId(), branch);
+        List<Map<String, Object>> res = list.stream().map(f -> {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("path", f.getFilePath());
+            map.put("name", f.getFileName());
+            map.put("extension", f.getFileExtension());
+            map.put("size", f.getFileSize());
+            map.put("isBinary", f.isBinary());
+            map.put("content", f.getContentText());
+            map.put("commitSha", f.getCommitSha());
+            return map;
+        }).toList();
+
+        return ResponseEntity.ok(res);
     }
 
     /**
