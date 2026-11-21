@@ -4,10 +4,12 @@ import com.mygit.backend.dto.PushPayload;
 import com.mygit.backend.model.GitObject;
 import com.mygit.backend.model.GitRef;
 import com.mygit.backend.model.Repository;
+import com.mygit.backend.model.RepositoryCommit;
 import com.mygit.backend.model.RepositoryFile;
 import com.mygit.backend.model.User;
 import com.mygit.backend.repository.GitObjectRepository;
 import com.mygit.backend.repository.GitRefRepository;
+import com.mygit.backend.repository.RepositoryCommitRepository;
 import com.mygit.backend.repository.RepositoryFileRepository;
 import com.mygit.backend.repository.RepositoryRepository;
 import com.mygit.backend.repository.UserRepository;
@@ -43,6 +45,9 @@ public class GitSyncController {
 
     @Autowired
     private RepositoryFileRepository repoFiles;
+
+    @Autowired
+    private RepositoryCommitRepository repoCommits;
 
     private String cleanRepoName(String name) {
         if (name == null) return "";
@@ -141,6 +146,12 @@ public class GitSyncController {
                 }
 
                 byte[] body = hex.parseHex(obj.content_hex());
+                if ("commit".equals(obj.type())) {
+                    try {
+                        String commitText = new String(body, StandardCharsets.UTF_8);
+                        saveCommitRecord(repo, obj.sha(), commitText);
+                    } catch (Exception ignored) {}
+                }
                 String headerStr = String.format("%s %d\0", obj.type(), body.length);
                 byte[] header = headerStr.getBytes(StandardCharsets.ISO_8859_1);
 
@@ -206,6 +217,25 @@ public class GitSyncController {
                     .orElse(new GitRef(repo, payload.ref(), payload.target_sha()));
             ref.setTargetSha(payload.target_sha());
             gitRefs.save(ref);
+
+            if (!repoCommits.existsByRepositoryIdAndCommitSha(repo.getId(), payload.target_sha())) {
+                gitObjects.findByRepositoryIdAndSha(repo.getId(), payload.target_sha()).ifPresent(gitObj -> {
+                    try (java.util.zip.InflaterInputStream iis = new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(gitObj.getData()))) {
+                        byte[] decompressed = iis.readAllBytes();
+                        int nullIdx = -1;
+                        for (int i = 0; i < decompressed.length; i++) {
+                            if (decompressed[i] == 0) {
+                                nullIdx = i;
+                                break;
+                            }
+                        }
+                        if (nullIdx != -1) {
+                            String bodyStr = new String(decompressed, nullIdx + 1, decompressed.length - (nullIdx + 1), StandardCharsets.UTF_8);
+                            saveCommitRecord(repo, payload.target_sha(), bodyStr);
+                        }
+                    } catch (Exception ignored) {}
+                });
+            }
         }
 
         return ResponseEntity.ok(Map.of(
@@ -277,5 +307,103 @@ public class GitSyncController {
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
                 .body(gitObj.getData());
+    }
+
+    /**
+     * Endpoint to fetch the commit history from repository_commits table.
+     */
+    @Transactional(readOnly = true)
+    @GetMapping(value = {
+            "/api/repos/{repoName}/commits",
+            "/api/repos/{owner}/{repoName}/commits"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> getRepositoryCommits(
+            @PathVariable String repoName,
+            @PathVariable(required = false) String owner,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        Repository repo = resolveRepository(repoName, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+
+        List<RepositoryCommit> list = repoCommits.findByRepositoryIdOrderByAuthoredAtDesc(repo.getId());
+        List<Map<String, Object>> res = list.stream().map(c -> {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("id", c.getId());
+            map.put("commitSha", c.getCommitSha());
+            map.put("parentSha", c.getParentSha());
+            map.put("treeSha", c.getTreeSha());
+            map.put("message", c.getMessage());
+            map.put("authorName", c.getAuthorName());
+            map.put("authorEmail", c.getAuthorEmail());
+            map.put("committerName", c.getCommitterName());
+            map.put("committerEmail", c.getCommitterEmail());
+            map.put("authoredAt", c.getAuthoredAt());
+            map.put("pushedAt", c.getPushedAt());
+            return map;
+        }).toList();
+
+        return ResponseEntity.ok(res);
+    }
+
+    private void saveCommitRecord(Repository repo, String sha, String commitText) {
+        if (repoCommits.existsByRepositoryIdAndCommitSha(repo.getId(), sha)) {
+            return;
+        }
+        String treeSha = null;
+        String parentSha = null;
+        String authorName = "mygit user";
+        String authorEmail = null;
+        String committerName = null;
+        String committerEmail = null;
+        java.time.LocalDateTime authoredAt = java.time.LocalDateTime.now();
+
+        String[] parts = commitText.split("\n\n", 2);
+        String header = parts[0];
+        String message = parts.length > 1 ? parts[1].trim() : "Commit " + sha.substring(0, Math.min(7, sha.length()));
+
+        for (String line : header.split("\n")) {
+            line = line.trim();
+            if (line.startsWith("tree ")) {
+                treeSha = line.substring(5).trim();
+            } else if (line.startsWith("parent ")) {
+                parentSha = line.substring(7).trim();
+            } else if (line.startsWith("author ")) {
+                String authorLine = line.substring(7).trim();
+                int emailStart = authorLine.indexOf('<');
+                int emailEnd = authorLine.indexOf('>');
+                if (emailStart != -1 && emailEnd > emailStart) {
+                    authorName = authorLine.substring(0, emailStart).trim();
+                    authorEmail = authorLine.substring(emailStart + 1, emailEnd).trim();
+                } else {
+                    authorName = authorLine;
+                }
+            } else if (line.startsWith("committer ")) {
+                String committerLine = line.substring(10).trim();
+                int emailStart = committerLine.indexOf('<');
+                int emailEnd = committerLine.indexOf('>');
+                if (emailStart != -1 && emailEnd > emailStart) {
+                    committerName = committerLine.substring(0, emailStart).trim();
+                    committerEmail = committerLine.substring(emailStart + 1, emailEnd).trim();
+                } else {
+                    committerName = committerLine;
+                }
+            }
+        }
+
+        RepositoryCommit commit = new RepositoryCommit(
+                repo,
+                sha,
+                parentSha,
+                treeSha,
+                message.isEmpty() ? "Commit " + sha.substring(0, Math.min(7, sha.length())) : message,
+                authorName,
+                authorEmail,
+                committerName,
+                committerEmail,
+                authoredAt
+        );
+        repoCommits.save(commit);
     }
 }
