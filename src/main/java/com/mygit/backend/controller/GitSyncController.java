@@ -294,6 +294,104 @@ public class GitSyncController {
     }
 
     /**
+     * Endpoint to list all branches for a repository.
+     */
+    @Transactional(readOnly = true)
+    @GetMapping(value = {
+            "/api/repos/{repoName}/branches",
+            "/api/repos/{owner}/{repoName}/branches"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> getRepositoryBranches(
+            @PathVariable String repoName,
+            @PathVariable(required = false) String owner,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        Repository repo = resolveRepository(repoName, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+
+        List<GitRef> refs = gitRefs.findByRepositoryId(repo.getId());
+        Set<String> branches = new LinkedHashSet<>();
+        for (GitRef ref : refs) {
+            if (ref.getRefName().startsWith("refs/heads/")) {
+                branches.add(ref.getRefName().substring("refs/heads/".length()));
+            }
+        }
+        if (branches.isEmpty()) {
+            branches.add("main");
+        }
+
+        List<Map<String, Object>> result = branches.stream().map(b -> {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put("name", b);
+            map.put("isDefault", "main".equalsIgnoreCase(b));
+            return map;
+        }).toList();
+
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * Endpoint to download repository contents as a ZIP archive.
+     */
+    @Transactional(readOnly = true)
+    @GetMapping(value = {
+            "/api/repos/{repoName}/archive/zip",
+            "/api/repos/{owner}/{repoName}/archive/zip"
+    }, produces = "application/zip")
+    public ResponseEntity<?> downloadRepositoryZip(
+            @PathVariable String repoName,
+            @PathVariable(required = false) String owner,
+            @RequestParam(defaultValue = "main") String branch,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        Repository repo = resolveRepository(repoName, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        }
+
+        List<RepositoryFile> files = repoFiles.findByRepositoryIdAndBranchName(repo.getId(), branch);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(baos)) {
+            for (RepositoryFile f : files) {
+                String entryPath = repo.getName() + "-" + branch + "/" + f.getFilePath();
+                java.util.zip.ZipEntry entry = new java.util.zip.ZipEntry(entryPath);
+                zos.putNextEntry(entry);
+
+                byte[] data;
+                if (f.getContentText() != null) {
+                    data = f.getContentText().getBytes(StandardCharsets.UTF_8);
+                } else if (f.getContentBytes() != null) {
+                    data = f.getContentBytes();
+                } else {
+                    GitObject gitObj = gitObjects.findByRepositoryIdAndSha(repo.getId(), f.getBlobSha()).orElse(null);
+                    if (gitObj != null) {
+                        byte[] decompressed = decompressGitObject(gitObj.getData());
+                        int nullIdx = findNullByte(decompressed);
+                        data = (nullIdx != -1) ? Arrays.copyOfRange(decompressed, nullIdx + 1, decompressed.length) : new byte[0];
+                    } else {
+                        data = new byte[0];
+                    }
+                }
+                zos.write(data);
+                zos.closeEntry();
+            }
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+
+        byte[] zipBytes = baos.toByteArray();
+        String filename = repo.getName() + "-" + branch + ".zip";
+
+        return ResponseEntity.ok()
+                .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(MediaType.parseMediaType("application/zip"))
+                .contentLength(zipBytes.length)
+                .body(zipBytes);
+    }
+
+    /**
      * Protocol: GET /objects/{sha} -> raw compressed git object
      */
     @Transactional(readOnly = true)
