@@ -236,6 +236,13 @@ public class GitSyncController {
                     } catch (Exception ignored) {}
                 });
             }
+
+            String branch = (payload.ref() != null && payload.ref().startsWith("refs/heads/"))
+                    ? payload.ref().substring("refs/heads/".length())
+                    : "main";
+            if (payload.files() == null || payload.files().isEmpty()) {
+                unpackCommitTreeToFiles(repo, branch, payload.target_sha(), principal);
+            }
         }
 
         return ResponseEntity.ok(Map.of(
@@ -405,5 +412,116 @@ public class GitSyncController {
                 authoredAt
         );
         repoCommits.save(commit);
+    }
+
+    private void unpackCommitTreeToFiles(Repository repo, String branch, String commitSha, CustomUser principal) {
+        if (commitSha == null || commitSha.isBlank()) return;
+        gitObjects.findByRepositoryIdAndSha(repo.getId(), commitSha).ifPresent(gitObj -> {
+            try {
+                byte[] decompressed = decompressGitObject(gitObj.getData());
+                int nullIdx = findNullByte(decompressed);
+                if (nullIdx == -1) return;
+                String commitBody = new String(decompressed, nullIdx + 1, decompressed.length - (nullIdx + 1), StandardCharsets.UTF_8);
+                String treeSha = null;
+                for (String line : commitBody.split("\n")) {
+                    if (line.startsWith("tree ")) {
+                        treeSha = line.substring(5).trim();
+                        break;
+                    }
+                }
+                if (treeSha != null) {
+                    User uploader = principal != null ? users.findById(principal.getId()).orElse(null) : null;
+                    walkAndSaveTree(repo, branch, treeSha, "", commitSha, uploader);
+                }
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private void walkAndSaveTree(Repository repo, String branch, String treeSha, String prefix, String commitSha, User uploader) {
+        gitObjects.findByRepositoryIdAndSha(repo.getId(), treeSha).ifPresent(gitObj -> {
+            try {
+                byte[] decompressed = decompressGitObject(gitObj.getData());
+                int nullIdx = findNullByte(decompressed);
+                if (nullIdx == -1) return;
+                byte[] treeBytes = Arrays.copyOfRange(decompressed, nullIdx + 1, decompressed.length);
+
+                HexFormat hex = HexFormat.of();
+                int i = 0;
+                while (i < treeBytes.length) {
+                    int spaceIdx = -1;
+                    for (int j = i; j < treeBytes.length; j++) {
+                        if (treeBytes[j] == ' ') { spaceIdx = j; break; }
+                    }
+                    if (spaceIdx == -1) break;
+                    String mode = new String(treeBytes, i, spaceIdx - i, StandardCharsets.ISO_8859_1);
+
+                    int entryNullIdx = -1;
+                    for (int j = spaceIdx + 1; j < treeBytes.length; j++) {
+                        if (treeBytes[j] == 0) { entryNullIdx = j; break; }
+                    }
+                    if (entryNullIdx == -1) break;
+                    String name = new String(treeBytes, spaceIdx + 1, entryNullIdx - (spaceIdx + 1), StandardCharsets.UTF_8);
+
+                    if (entryNullIdx + 21 > treeBytes.length) break;
+                    byte[] shaBytes = Arrays.copyOfRange(treeBytes, entryNullIdx + 1, entryNullIdx + 21);
+                    String sha = hex.formatHex(shaBytes);
+
+                    i = entryNullIdx + 21;
+
+                    String fullPath = prefix.isEmpty() ? name : prefix + "/" + name;
+                    if ("40000".equals(mode) || "040000".equals(mode)) {
+                        walkAndSaveTree(repo, branch, sha, fullPath, commitSha, uploader);
+                    } else {
+                        saveBlobAsFile(repo, branch, fullPath, name, sha, commitSha, uploader);
+                    }
+                }
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private void saveBlobAsFile(Repository repo, String branch, String fullPath, String fileName, String blobSha, String commitSha, User uploader) {
+        String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.') + 1) : "";
+        gitObjects.findByRepositoryIdAndSha(repo.getId(), blobSha).ifPresent(gitObj -> {
+            try {
+                byte[] decompressed = decompressGitObject(gitObj.getData());
+                int nullIdx = findNullByte(decompressed);
+                if (nullIdx == -1) return;
+                byte[] blobBytes = Arrays.copyOfRange(decompressed, nullIdx + 1, decompressed.length);
+                long size = blobBytes.length;
+                boolean isBin = false;
+                String contentText = null;
+                for (byte b : blobBytes) {
+                    if (b == 0) { isBin = true; break; }
+                }
+                if (!isBin) {
+                    contentText = new String(blobBytes, StandardCharsets.UTF_8);
+                }
+
+                RepositoryFile repoFile = repoFiles
+                        .findByRepositoryIdAndBranchNameAndFilePath(repo.getId(), branch, fullPath)
+                        .orElse(new RepositoryFile(
+                                repo, branch, fullPath, fileName, ext, size, commitSha, blobSha, contentText, null, isBin, uploader
+                        ));
+                repoFile.setCommitSha(commitSha);
+                repoFile.setBlobSha(blobSha);
+                repoFile.setFileSize(size);
+                repoFile.setContentText(contentText);
+                repoFile.setBinary(isBin);
+                repoFiles.save(repoFile);
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private byte[] decompressGitObject(byte[] data) throws IOException {
+        try (java.util.zip.InflaterInputStream iis = new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(data))) {
+            return iis.readAllBytes();
+        }
+    }
+
+    private int findNullByte(byte[] data) {
+        for (int i = 0; i < data.length; i++) {
+            if (data[i] == 0) return i;
+        }
+        return -1;
     }
 }
