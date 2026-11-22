@@ -177,10 +177,12 @@ public class GitSyncController {
             String commitSha = payload.target_sha() != null ? payload.target_sha() : "";
 
             User uploader = users.findById(principal.getId()).orElse(null);
+            Set<String> activePaths = new HashSet<>();
 
             for (PushPayload.PushedFile pf : payload.files()) {
                 String path = pf.path();
                 if (path == null || path.isBlank()) continue;
+                activePaths.add(path);
                 String fileName = path.contains("/") ? path.substring(path.lastIndexOf('/') + 1) : path;
                 String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.') + 1) : "";
 
@@ -208,6 +210,10 @@ public class GitSyncController {
                 repoFile.setBinary(Boolean.TRUE.equals(pf.is_binary()));
 
                 repoFiles.save(repoFile);
+            }
+
+            if (!activePaths.isEmpty()) {
+                repoFiles.deleteByRepositoryIdAndBranchNameAndFilePathNotIn(repo.getId(), branch, activePaths);
             }
         }
 
@@ -431,13 +437,17 @@ public class GitSyncController {
                 }
                 if (treeSha != null) {
                     User uploader = principal != null ? users.findById(principal.getId()).orElse(null) : null;
-                    walkAndSaveTree(repo, branch, treeSha, "", commitSha, uploader);
+                    Set<String> activePaths = new HashSet<>();
+                    walkAndSaveTree(repo, branch, treeSha, "", commitSha, uploader, activePaths);
+                    if (!activePaths.isEmpty()) {
+                        repoFiles.deleteByRepositoryIdAndBranchNameAndFilePathNotIn(repo.getId(), branch, activePaths);
+                    }
                 }
             } catch (Exception ignored) {}
         });
     }
 
-    private void walkAndSaveTree(Repository repo, String branch, String treeSha, String prefix, String commitSha, User uploader) {
+    private void walkAndSaveTree(Repository repo, String branch, String treeSha, String prefix, String commitSha, User uploader, Set<String> activePaths) {
         gitObjects.findByRepositoryIdAndSha(repo.getId(), treeSha).ifPresent(gitObj -> {
             try {
                 byte[] decompressed = decompressGitObject(gitObj.getData());
@@ -470,8 +480,9 @@ public class GitSyncController {
 
                     String fullPath = prefix.isEmpty() ? name : prefix + "/" + name;
                     if ("40000".equals(mode) || "040000".equals(mode)) {
-                        walkAndSaveTree(repo, branch, sha, fullPath, commitSha, uploader);
+                        walkAndSaveTree(repo, branch, sha, fullPath, commitSha, uploader, activePaths);
                     } else {
+                        activePaths.add(fullPath);
                         saveBlobAsFile(repo, branch, fullPath, name, sha, commitSha, uploader);
                     }
                 }

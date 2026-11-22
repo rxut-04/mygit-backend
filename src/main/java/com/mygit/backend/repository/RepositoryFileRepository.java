@@ -15,5 +15,11 @@ public interface RepositoryFileRepository extends JpaRepository<RepositoryFile, 
 
     Optional<RepositoryFile> findByRepositoryIdAndBranchNameAndFilePath(Long repositoryId, String branchName, String filePath);
 
+    @org.springframework.data.jpa.repository.Modifying
+    @org.springframework.transaction.annotation.Transactional
     void deleteByRepositoryIdAndBranchName(Long repositoryId, String branchName);
+
+    @org.springframework.data.jpa.repository.Modifying
+    @org.springframework.transaction.annotation.Transactional
+    void deleteByRepositoryIdAndBranchNameAndFilePathNotIn(Long repositoryId, String branchName, java.util.Collection<String> filePaths);
 }
