@@ -39,6 +39,8 @@ public class SecurityConfig {
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/commits", "/api/repos/*/*/commits").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/branches", "/api/repos/*/*/branches").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/archive/**", "/api/repos/*/*/archive/**").permitAll()
+                        .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/pulls/**", "/api/repos/*/*/pulls/**").permitAll()
+                        .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/commits/**", "/api/repos/*/*/commits/**").permitAll()
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)

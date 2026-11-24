@@ -49,6 +49,9 @@ public class GitSyncController {
     @Autowired
     private RepositoryCommitRepository repoCommits;
 
+    @Autowired
+    private com.mygit.backend.service.DiffService diffService;
+
     private String cleanRepoName(String name) {
         if (name == null) return "";
         if (name.endsWith(".mygit")) {
@@ -456,6 +459,153 @@ public class GitSyncController {
         }).toList();
 
         return ResponseEntity.ok(res);
+    }
+
+    /**
+     * Endpoint to fetch the diff for a specific commit compared to its parent.
+     */
+    @Transactional(readOnly = true)
+    @GetMapping(value = {
+            "/api/repos/{repoName}/commits/{commitSha}/diff",
+            "/api/repos/{owner}/{repoName}/commits/{commitSha}/diff"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> getCommitDiff(
+            @PathVariable String repoName,
+            @PathVariable(required = false) String owner,
+            @PathVariable String commitSha,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        Repository repo = resolveRepository(repoName, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+
+        RepositoryCommit commit = repoCommits.findByRepositoryIdAndCommitSha(repo.getId(), commitSha).orElse(null);
+        if (commit == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Commit not found"));
+        }
+
+        String parentSha = commit.getParentSha();
+
+        Map<String, String> commitFiles = extractFilesForCommit(repo.getId(), commitSha);
+        Map<String, String> parentFiles = (parentSha != null && !parentSha.isBlank())
+                ? extractFilesForCommit(repo.getId(), parentSha)
+                : Collections.emptyMap();
+
+        Set<String> allPaths = new TreeSet<>();
+        allPaths.addAll(commitFiles.keySet());
+        allPaths.addAll(parentFiles.keySet());
+
+        List<com.mygit.backend.service.DiffService.FileDiffResult> fileDiffs = new ArrayList<>();
+        for (String path : allPaths) {
+            String oldContent = parentFiles.get(path);
+            String newContent = commitFiles.get(path);
+
+            com.mygit.backend.service.DiffService.FileDiffResult fdiff = diffService.computeFileDiff(path, oldContent, newContent);
+            if (!"UNCHANGED".equals(fdiff.getStatus())) {
+                fileDiffs.add(fdiff);
+            }
+        }
+
+        int totalAdditions = fileDiffs.stream().mapToInt(com.mygit.backend.service.DiffService.FileDiffResult::getAdditions).sum();
+        int totalDeletions = fileDiffs.stream().mapToInt(com.mygit.backend.service.DiffService.FileDiffResult::getDeletions).sum();
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("commitSha", commit.getCommitSha());
+        response.put("parentSha", commit.getParentSha());
+        response.put("treeSha", commit.getTreeSha());
+        response.put("message", commit.getMessage());
+        response.put("authorName", commit.getAuthorName());
+        response.put("authorEmail", commit.getAuthorEmail());
+        response.put("authoredAt", commit.getAuthoredAt());
+        response.put("totalAdditions", totalAdditions);
+        response.put("totalDeletions", totalDeletions);
+        response.put("filesChangedCount", fileDiffs.size());
+        response.put("files", fileDiffs);
+
+        return ResponseEntity.ok(response);
+    }
+
+    private Map<String, String> extractFilesForCommit(Long repoId, String commitSha) {
+        Map<String, String> result = new LinkedHashMap<>();
+        gitObjects.findByRepositoryIdAndSha(repoId, commitSha).ifPresent(gitObj -> {
+            try {
+                byte[] decompressed = decompressGitObject(gitObj.getData());
+                int nullIdx = findNullByte(decompressed);
+                if (nullIdx == -1) return;
+                String commitBody = new String(decompressed, nullIdx + 1, decompressed.length - (nullIdx + 1), StandardCharsets.UTF_8);
+                String treeSha = null;
+                for (String line : commitBody.split("\n")) {
+                    if (line.startsWith("tree ")) {
+                        treeSha = line.substring(5).trim();
+                        break;
+                    }
+                }
+                if (treeSha != null) {
+                    walkTreeToContentMap(repoId, treeSha, "", result);
+                }
+            } catch (Exception ignored) {}
+        });
+        if (result.isEmpty()) {
+            List<RepositoryFile> rfs = repoFiles.findByRepositoryId(repoId);
+            for (RepositoryFile rf : rfs) {
+                if (commitSha.equals(rf.getCommitSha()) && rf.getContentText() != null) {
+                    result.put(rf.getFilePath(), rf.getContentText());
+                }
+            }
+        }
+        return result;
+    }
+
+    private void walkTreeToContentMap(Long repoId, String treeSha, String prefix, Map<String, String> result) {
+        gitObjects.findByRepositoryIdAndSha(repoId, treeSha).ifPresent(gitObj -> {
+            try {
+                byte[] decompressed = decompressGitObject(gitObj.getData());
+                int nullIdx = findNullByte(decompressed);
+                if (nullIdx == -1) return;
+                byte[] treeBytes = Arrays.copyOfRange(decompressed, nullIdx + 1, decompressed.length);
+
+                HexFormat hex = HexFormat.of();
+                int i = 0;
+                while (i < treeBytes.length) {
+                    int spaceIdx = -1;
+                    for (int j = i; j < treeBytes.length; j++) {
+                        if (treeBytes[j] == ' ') { spaceIdx = j; break; }
+                    }
+                    if (spaceIdx == -1) break;
+                    String mode = new String(treeBytes, i, spaceIdx - i, StandardCharsets.ISO_8859_1);
+
+                    int entryNullIdx = -1;
+                    for (int j = spaceIdx + 1; j < treeBytes.length; j++) {
+                        if (treeBytes[j] == 0) { entryNullIdx = j; break; }
+                    }
+                    if (entryNullIdx == -1) break;
+                    String name = new String(treeBytes, spaceIdx + 1, entryNullIdx - (spaceIdx + 1), StandardCharsets.UTF_8);
+
+                    if (entryNullIdx + 21 > treeBytes.length) break;
+                    byte[] shaBytes = Arrays.copyOfRange(treeBytes, entryNullIdx + 1, entryNullIdx + 21);
+                    String sha = hex.formatHex(shaBytes);
+
+                    i = entryNullIdx + 21;
+
+                    String fullPath = prefix.isEmpty() ? name : prefix + "/" + name;
+                    if ("40000".equals(mode) || "040000".equals(mode)) {
+                        walkTreeToContentMap(repoId, sha, fullPath, result);
+                    } else {
+                        gitObjects.findByRepositoryIdAndSha(repoId, sha).ifPresent(blobObj -> {
+                            try {
+                                byte[] blobDecomp = decompressGitObject(blobObj.getData());
+                                int bNull = findNullByte(blobDecomp);
+                                if (bNull != -1) {
+                                    byte[] content = Arrays.copyOfRange(blobDecomp, bNull + 1, blobDecomp.length);
+                                    result.put(fullPath, new String(content, StandardCharsets.UTF_8));
+                                }
+                            } catch (Exception ignored) {}
+                        });
+                    }
+                }
+            } catch (Exception ignored) {}
+        });
     }
 
     private void saveCommitRecord(Repository repo, String sha, String commitText) {
