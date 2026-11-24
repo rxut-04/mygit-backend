@@ -26,6 +26,10 @@ public class Repository {
     @JoinColumn(name = "owner_id", nullable = false)
     private User owner;
 
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "parent_repository_id")
+    private Repository parentRepository;
+
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
@@ -99,5 +103,17 @@ public class Repository {
 
     public LocalDateTime getUpdatedAt() {
         return updatedAt;
+    }
+
+    public void setUpdatedAt(LocalDateTime updatedAt) {
+        this.updatedAt = updatedAt;
+    }
+
+    public Repository getParentRepository() {
+        return parentRepository;
+    }
+
+    public void setParentRepository(Repository parentRepository) {
+        this.parentRepository = parentRepository;
     }
 }
