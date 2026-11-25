@@ -62,7 +62,7 @@ public class SecurityConfig {
                 "http://localhost:*",
                 "http://127.0.0.1:*",
                 "https://*.netlify.app",
-                "https://velvety-druid-dccd85.netlify.app",
+                "https://the-only-git-platform-you-need.netlify.app",
                 "https://*.onrender.com"
         ));
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"));
