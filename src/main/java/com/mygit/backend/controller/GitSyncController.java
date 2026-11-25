@@ -771,6 +771,90 @@ public class GitSyncController {
         });
     }
 
+    @Transactional
+    @PostMapping(value = {
+            "/api/repos/{repoName}/files",
+            "/api/repos/{owner}/{repoName}/files"
+    }, consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> upsertFile(
+            @PathVariable String repoName,
+            @PathVariable(required = false) String owner,
+            @RequestBody Map<String, String> body,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
+        }
+        Repository repo = resolveRepository(repoName, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+        if (!repo.getOwner().getId().equals(principal.getId())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Only repository owner can edit files"));
+        }
+
+        String rawPath = body.getOrDefault("path", "").trim().replace("\\", "/");
+        while (rawPath.startsWith("/")) rawPath = rawPath.substring(1);
+        if (rawPath.isEmpty() || rawPath.contains("..")) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid file path"));
+        }
+        String branch = body.getOrDefault("branch", "main").trim();
+        if (branch.isEmpty()) branch = "main";
+        String content = body.getOrDefault("content", "");
+        String message = body.getOrDefault("message", "").trim();
+        if (message.isEmpty()) message = "Update " + rawPath;
+
+        byte[] contentBytes = content.getBytes(StandardCharsets.UTF_8);
+        String blobSha = sha1Hex("blob " + contentBytes.length + "\0", contentBytes);
+        String commitSha = sha1Hex("web-commit:" + repo.getId() + ":" + System.currentTimeMillis() + ":" + rawPath + "\0", contentBytes);
+
+        String fileName = rawPath.contains("/") ? rawPath.substring(rawPath.lastIndexOf('/') + 1) : rawPath;
+        String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.') + 1) : "";
+
+        User uploader = users.findById(principal.getId()).orElse(repo.getOwner());
+        RepositoryFile repoFile = repoFiles
+                .findByRepositoryIdAndBranchNameAndFilePath(repo.getId(), branch, rawPath)
+                .orElse(new RepositoryFile(
+                        repo, branch, rawPath, fileName, ext, (long) contentBytes.length,
+                        commitSha, blobSha, content, null, false, uploader
+                ));
+        repoFile.setCommitSha(commitSha);
+        repoFile.setBlobSha(blobSha);
+        repoFile.setFileSize((long) contentBytes.length);
+        repoFile.setContentText(content);
+        repoFile.setBinary(false);
+        repoFiles.save(repoFile);
+
+        RepositoryCommit commit = new RepositoryCommit(
+                repo, commitSha, null, blobSha, message,
+                uploader.getUsername(), uploader.getEmail(),
+                uploader.getUsername(), uploader.getEmail(),
+                java.time.LocalDateTime.now()
+        );
+        repoCommits.save(commit);
+
+        return ResponseEntity.ok(Map.of(
+                "path", rawPath,
+                "branch", branch,
+                "commitSha", commitSha,
+                "blobSha", blobSha
+        ));
+    }
+
+    private String sha1Hex(String header, byte[] body) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
+            md.update(header.getBytes(StandardCharsets.UTF_8));
+            md.update(body);
+            byte[] digest = md.digest();
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return UUID.randomUUID().toString().replace("-", "");
+        }
+    }
+
     private byte[] decompressGitObject(byte[] data) throws IOException {
         try (java.util.zip.InflaterInputStream iis = new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(data))) {
             return iis.readAllBytes();
