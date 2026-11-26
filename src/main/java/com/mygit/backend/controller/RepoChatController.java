@@ -116,11 +116,17 @@ public class RepoChatController {
             }
         }
 
+        String openRouterKey = System.getenv("OPENROUTER_API_KEY");
+        String openRouterModel = System.getenv("OPENROUTER_MODEL");
+        if (openRouterModel == null || openRouterModel.isBlank()) {
+            openRouterModel = "nvidia/nemotron-3-ultra-550b-a55b:free";
+        }
         String geminiKey = System.getenv("GEMINI_API_KEY");
         String openAiKey = System.getenv("OPENAI_API_KEY");
         String groqKey = System.getenv("GROQ_API_KEY");
 
         String replyText = null;
+        String llmReasoning = null;
         String modelUsed = "static-analyzer";
         long llmStart = System.currentTimeMillis();
 
@@ -129,7 +135,14 @@ public class RepoChatController {
                 + "Ground every answer strictly in the repository context provided.\n\n" + context;
 
         try {
-            if (geminiKey != null && !geminiKey.isBlank()) {
+            if (openRouterKey != null && !openRouterKey.isBlank()) {
+                String[] orRes = callOpenRouter(openRouterKey, openRouterModel, systemPrompt, question);
+                if (orRes != null) {
+                    replyText = orRes[0];
+                    llmReasoning = orRes[1];
+                    modelUsed = openRouterModel;
+                }
+            } else if (geminiKey != null && !geminiKey.isBlank()) {
                 replyText = callGemini(geminiKey, systemPrompt, question);
                 modelUsed = "gemini-2.5-flash";
             } else if (groqKey != null && !groqKey.isBlank()) {
@@ -149,7 +162,9 @@ public class RepoChatController {
             replyText = buildStaticFallbackReply(repo, branch, repoFiles, recentCommits, activeFilePath, activeFileContent, question);
         }
 
-        String reasoning = "Inspecting " + repo.getOwner().getUsername() + "/" + repo.getName()
+        String reasoning = (llmReasoning != null && !llmReasoning.isBlank())
+                ? llmReasoning
+                : "Inspecting " + repo.getOwner().getUsername() + "/" + repo.getName()
                 + " on branch " + branch
                 + (activeFilePath.isBlank() ? "" : " with active file " + activeFilePath)
                 + " across " + repoFiles.size() + " tracked files and " + recentCommits.size() + " commits.";
@@ -179,6 +194,32 @@ public class RepoChatController {
         result.put("steps", steps);
         result.put("model", modelUsed);
         return ResponseEntity.ok(result);
+    }
+
+    private String[] callOpenRouter(String apiKey, String model, String systemPrompt, String question) throws Exception {
+        Map<String, Object> payload = Map.of(
+                "model", model,
+                "messages", List.of(
+                        Map.of("role", "system", "content", systemPrompt),
+                        Map.of("role", "user", "content", question)
+                )
+        );
+        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
+        HttpRequest req = HttpRequest.newBuilder(URI.create("https://openrouter.ai/api/v1/chat/completions"))
+                .timeout(Duration.ofSeconds(40))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("HTTP-Referer", "https://the-only-git-platform-you-need.netlify.app")
+                .header("X-Title", "mygit")
+                .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload)))
+                .build();
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() < 200 || resp.statusCode() >= 300) return null;
+        JsonNode root = mapper.readTree(resp.body());
+        JsonNode msg = root.path("choices").path(0).path("message");
+        String content = msg.path("content").asText(null);
+        String reasoning = msg.path("reasoning").asText(null);
+        return new String[]{content, reasoning};
     }
 
     private String callGemini(String apiKey, String systemPrompt, String question) throws Exception {
