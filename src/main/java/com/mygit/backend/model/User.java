@@ -35,6 +35,15 @@ public class User {
     @Column(length = 255)
     private String website;
 
+    @Column(nullable = false)
+    private boolean emailOnPr = true;
+
+    @Column(nullable = false)
+    private boolean emailOnMention = true;
+
+    @Column(nullable = false)
+    private boolean weeklyDigest = false;
+
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
@@ -118,5 +127,29 @@ public class User {
 
     public void setWebsite(String website) {
         this.website = website;
+    }
+
+    public boolean isEmailOnPr() {
+        return emailOnPr;
+    }
+
+    public void setEmailOnPr(boolean emailOnPr) {
+        this.emailOnPr = emailOnPr;
+    }
+
+    public boolean isEmailOnMention() {
+        return emailOnMention;
+    }
+
+    public void setEmailOnMention(boolean emailOnMention) {
+        this.emailOnMention = emailOnMention;
+    }
+
+    public boolean isWeeklyDigest() {
+        return weeklyDigest;
+    }
+
+    public void setWeeklyDigest(boolean weeklyDigest) {
+        this.weeklyDigest = weeklyDigest;
     }
 }

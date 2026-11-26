@@ -21,6 +21,9 @@ public class PersonalAccessToken {
     @Column(nullable = false, length = 120)
     private String tokenPreview;
 
+    @Column(length = 64, unique = true)
+    private String tokenHash;
+
     @Column(nullable = false, length = 255)
     private String scopes = "repo:read,repo:write";
 
@@ -54,6 +57,8 @@ public class PersonalAccessToken {
     public void setName(String name) { this.name = name; }
     public String getTokenPreview() { return tokenPreview; }
     public void setTokenPreview(String tokenPreview) { this.tokenPreview = tokenPreview; }
+    public String getTokenHash() { return tokenHash; }
+    public void setTokenHash(String tokenHash) { this.tokenHash = tokenHash; }
     public String getScopes() { return scopes; }
     public void setScopes(String scopes) { this.scopes = scopes; }
     public String getExpiresLabel() { return expiresLabel; }

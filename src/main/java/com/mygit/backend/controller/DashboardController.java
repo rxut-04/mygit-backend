@@ -12,11 +12,19 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.io.ByteArrayInputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 @RestController
 public class DashboardController {
@@ -33,6 +41,29 @@ public class DashboardController {
     @Autowired private PersonalAccessTokenRepository tokens;
     @Autowired private SshKeyRepository sshKeys;
     @Autowired private DiscussionRepository discussions;
+    @Autowired private DiscussionCommentRepository discussionComments;
+    @Autowired private NotificationStateRepository notificationStates;
+    @Autowired private GitObjectRepository gitObjects;
+    @Autowired private GitRefRepository gitRefs;
+
+    private static String sha256Hex(String input) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } catch (Exception e) {
+            return Integer.toHexString(input.hashCode());
+        }
+    }
+
+    private static String sha1Hex(byte[] data) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            return HexFormat.of().formatHex(md.digest(data));
+        } catch (Exception e) {
+            return UUID.randomUUID().toString().replace("-", "");
+        }
+    }
 
     private String detectPrimaryLanguage(Long repoId) {
         List<RepositoryFile> repoFiles = files.findByRepositoryId(repoId);
@@ -285,6 +316,39 @@ public class DashboardController {
         activity.sort(byTimestampDesc);
         notifications.sort(byTimestampDesc);
 
+        Map<String, NotificationState> stateByKey = notificationStates.findByUserId(userId).stream()
+                .collect(Collectors.toMap(NotificationState::getNotificationKey, s -> s, (a, b) -> a));
+
+        List<Map<String, Object>> filteredNotifications = new ArrayList<>();
+        for (Map<String, Object> n : notifications) {
+            String key = String.valueOf(n.get("id"));
+            NotificationState st = stateByKey.get(key);
+            if (st != null && st.isMuted()) {
+                continue;
+            }
+            if (st != null && st.isRead()) {
+                n.put("unread", false);
+            }
+            filteredNotifications.add(n);
+        }
+
+        List<Map<String, Object>> starredReposList = new ArrayList<>();
+        for (RepositoryStar s : stars.findByUserIdWithRepo(userId)) {
+            Repository sr = s.getRepository();
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", sr.getId());
+            m.put("name", sr.getName());
+            m.put("description", sr.getDescription());
+            m.put("isPrivate", sr.isPrivate());
+            m.put("ownerUsername", sr.getOwner().getUsername());
+            m.put("starsCount", stars.countByRepositoryId(sr.getId()));
+            m.put("forksCount", repos.countByParentRepositoryId(sr.getId()));
+            m.put("isStarred", true);
+            m.put("primaryLanguage", detectPrimaryLanguage(sr.getId()));
+            m.put("updatedAt", sr.getUpdatedAt());
+            starredReposList.add(m);
+        }
+
         Map<String, Object> profile = new LinkedHashMap<>();
         profile.put("username", user.getUsername());
         profile.put("email", user.getEmail());
@@ -294,8 +358,14 @@ public class DashboardController {
         profile.put("website", user.getWebsite());
         profile.put("createdAt", user.getCreatedAt());
 
+        Map<String, Object> settings = new LinkedHashMap<>();
+        settings.put("emailOnPr", user.isEmailOnPr());
+        settings.put("emailOnMention", user.isEmailOnMention());
+        settings.put("weeklyDigest", user.isWeeklyDigest());
+
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("repos", enrichedRepos);
+        response.put("starredRepos", starredReposList);
         response.put("reposCount", userRepos.size());
         response.put("publicReposCount", publicCount);
         response.put("privateReposCount", privateCount);
@@ -308,8 +378,9 @@ public class DashboardController {
         response.put("pullRequests", prList);
         response.put("issues", issueList);
         response.put("activity", activity.stream().limit(40).toList());
-        response.put("notifications", notifications.stream().limit(40).toList());
+        response.put("notifications", filteredNotifications.stream().limit(40).toList());
         response.put("profile", profile);
+        response.put("settings", settings);
 
         return ResponseEntity.ok(response);
     }
@@ -377,7 +448,9 @@ public class DashboardController {
 
         String rawToken = "mygit_pat_" + UUID.randomUUID().toString().replace("-", "").substring(0, 24);
         String preview = rawToken.substring(0, 14) + "••••••••••" + rawToken.substring(rawToken.length() - 4);
-        PersonalAccessToken pat = tokens.save(new PersonalAccessToken(user, name, preview, scopes, expires));
+        PersonalAccessToken patEntity = new PersonalAccessToken(user, name, preview, scopes, expires);
+        patEntity.setTokenHash(sha256Hex(rawToken));
+        PersonalAccessToken pat = tokens.save(patEntity);
 
         Map<String, Object> res = new LinkedHashMap<>();
         res.put("id", pat.getId());
@@ -497,5 +570,277 @@ public class DashboardController {
         res.put("createdAt", saved.getCreatedAt());
         res.put("updatedAt", saved.getUpdatedAt());
         return ResponseEntity.status(HttpStatus.CREATED).body(res);
+    }
+
+    @Transactional(readOnly = true)
+    @GetMapping(value = "/api/discussions/{id}/comments", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> listDiscussionComments(@PathVariable Long id) {
+        if (!discussions.existsById(id)) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Discussion not found"));
+        }
+        List<Map<String, Object>> list = discussionComments.findByDiscussionIdOrderByCreatedAtAsc(id).stream().map(c -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", c.getId());
+            m.put("author", c.getAuthor().getUsername());
+            m.put("body", c.getBody());
+            m.put("createdAt", c.getCreatedAt());
+            return m;
+        }).toList();
+        return ResponseEntity.ok(list);
+    }
+
+    @Transactional
+    @PostMapping(value = "/api/discussions/{id}/comments", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> addDiscussionComment(
+            @AuthenticationPrincipal CustomUser principal,
+            @PathVariable Long id,
+            @RequestBody Map<String, String> body
+    ) {
+        if (principal == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        Discussion d = discussions.findById(id).orElse(null);
+        if (d == null) return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Discussion not found"));
+        String text = String.valueOf(body.getOrDefault("body", "")).trim();
+        if (text.isEmpty()) return ResponseEntity.badRequest().body(Map.of("error", "Comment body is required"));
+
+        User user = users.findById(principal.getId()).orElseThrow();
+        DiscussionComment saved = discussionComments.save(new DiscussionComment(d, user, text));
+        d.setRepliesCount(d.getRepliesCount() + 1);
+        discussions.save(d);
+
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("id", saved.getId());
+        res.put("author", user.getUsername());
+        res.put("body", saved.getBody());
+        res.put("createdAt", saved.getCreatedAt());
+        res.put("replies", d.getRepliesCount());
+        return ResponseEntity.status(HttpStatus.CREATED).body(res);
+    }
+
+    @Transactional
+    @PatchMapping(value = "/api/user/settings", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> updateSettings(
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody Map<String, Object> body
+    ) {
+        if (principal == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        User user = users.findById(principal.getId()).orElseThrow();
+        if (body.containsKey("emailOnPr")) user.setEmailOnPr(Boolean.parseBoolean(String.valueOf(body.get("emailOnPr"))));
+        if (body.containsKey("emailOnMention")) user.setEmailOnMention(Boolean.parseBoolean(String.valueOf(body.get("emailOnMention"))));
+        if (body.containsKey("weeklyDigest")) user.setWeeklyDigest(Boolean.parseBoolean(String.valueOf(body.get("weeklyDigest"))));
+        users.save(user);
+        return ResponseEntity.ok(Map.of(
+                "emailOnPr", user.isEmailOnPr(),
+                "emailOnMention", user.isEmailOnMention(),
+                "weeklyDigest", user.isWeeklyDigest()
+        ));
+    }
+
+    @Transactional
+    @PostMapping(value = "/api/user/notifications/read-all", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> markAllNotificationsRead(
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody(required = false) Map<String, Object> body
+    ) {
+        if (principal == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        User user = users.findById(principal.getId()).orElseThrow();
+        List<String> keys = new ArrayList<>();
+        if (body != null && body.get("keys") instanceof List<?> rawList) {
+            for (Object k : rawList) keys.add(String.valueOf(k));
+        }
+        for (String key : keys) {
+            NotificationState st = notificationStates.findByUserIdAndNotificationKey(user.getId(), key)
+                    .orElse(new NotificationState(user, key, true, false));
+            st.setRead(true);
+            notificationStates.save(st);
+        }
+        return ResponseEntity.ok(Map.of("message", "All notifications marked as read"));
+    }
+
+    @Transactional
+    @PostMapping(value = "/api/user/notifications/{key}/read", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> markNotificationRead(
+            @AuthenticationPrincipal CustomUser principal,
+            @PathVariable String key
+    ) {
+        if (principal == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        User user = users.findById(principal.getId()).orElseThrow();
+        NotificationState st = notificationStates.findByUserIdAndNotificationKey(user.getId(), key)
+                .orElse(new NotificationState(user, key, true, false));
+        st.setRead(true);
+        notificationStates.save(st);
+        return ResponseEntity.ok(Map.of("key", key, "unread", false));
+    }
+
+    @Transactional
+    @PostMapping(value = "/api/user/notifications/{key}/mute", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> muteNotification(
+            @AuthenticationPrincipal CustomUser principal,
+            @PathVariable String key
+    ) {
+        if (principal == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        User user = users.findById(principal.getId()).orElseThrow();
+        NotificationState st = notificationStates.findByUserIdAndNotificationKey(user.getId(), key)
+                .orElse(new NotificationState(user, key, true, true));
+        st.setRead(true);
+        st.setMuted(true);
+        notificationStates.save(st);
+        return ResponseEntity.ok(Map.of("key", key, "muted", true));
+    }
+
+    @Transactional
+    @DeleteMapping(value = "/api/user", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> deleteAccount(@AuthenticationPrincipal CustomUser principal) {
+        if (principal == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        User user = users.findById(principal.getId()).orElse(null);
+        if (user == null) return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
+        Long userId = user.getId();
+        tokens.deleteAll(tokens.findByUserIdOrderByCreatedAtDesc(userId));
+        sshKeys.deleteAll(sshKeys.findByUserIdOrderByCreatedAtDesc(userId));
+        notificationStates.deleteByUserId(userId);
+        stars.deleteAll(stars.findByUserIdWithRepo(userId));
+        repos.deleteAll(repos.findByOwnerId(userId));
+        users.delete(user);
+        return ResponseEntity.ok(Map.of("message", "Account deleted"));
+    }
+
+    @Transactional
+    @PostMapping(value = "/api/repos/import", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> importRepository(
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody Map<String, Object> body
+    ) {
+        if (principal == null) return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
+        User user = users.findById(principal.getId()).orElseThrow();
+
+        String rawUrl = String.valueOf(body.getOrDefault("url", "")).trim();
+        String reqName = String.valueOf(body.getOrDefault("name", "")).trim();
+        boolean isPrivate = Boolean.parseBoolean(String.valueOf(body.getOrDefault("isPrivate", "false")));
+
+        if (rawUrl.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Repository URL is required"));
+        }
+
+        String normalized = rawUrl.replaceAll("\\.git$", "").replaceAll("/+$", "");
+        String[] parts = normalized.split("/");
+        if (parts.length < 2) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid repository URL. Expected https://github.com/owner/repo"));
+        }
+        String remoteOwner = parts[parts.length - 2];
+        String remoteRepo = parts[parts.length - 1];
+        String repoName = reqName.isEmpty() ? remoteRepo : reqName;
+
+        if (repos.existsByOwnerIdAndName(user.getId(), repoName)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("error", "Repository '" + repoName + "' already exists in your workspace"));
+        }
+
+        String zipUrl = "https://github.com/" + remoteOwner + "/" + remoteRepo + "/archive/HEAD.zip";
+        byte[] zipBytes;
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .connectTimeout(Duration.ofSeconds(15))
+                    .build();
+            HttpRequest req = HttpRequest.newBuilder(URI.create(zipUrl))
+                    .timeout(Duration.ofSeconds(30))
+                    .header("User-Agent", "mygit-importer/1.0")
+                    .GET()
+                    .build();
+            HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() < 200 || resp.statusCode() >= 300) {
+                return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                        .body(Map.of("error", "Unable to fetch repository archive (HTTP " + resp.statusCode() + "). Ensure the GitHub repository is public."));
+            }
+            zipBytes = resp.body();
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("error", "Failed to download repository: " + e.getMessage()));
+        }
+
+        Repository repo = repos.save(new Repository(
+                repoName,
+                "Imported from " + rawUrl,
+                isPrivate,
+                user
+        ));
+
+        String commitPayload = "import " + rawUrl + " " + System.currentTimeMillis();
+        String commitSha = sha1Hex(commitPayload.getBytes(StandardCharsets.UTF_8));
+
+        int importedFiles = 0;
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(zipBytes))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.isDirectory()) continue;
+                String fullPath = entry.getName();
+                int slashIdx = fullPath.indexOf('/');
+                String relPath = (slashIdx >= 0 && slashIdx + 1 < fullPath.length())
+                        ? fullPath.substring(slashIdx + 1)
+                        : fullPath;
+                if (relPath.isEmpty() || relPath.startsWith(".git/")) continue;
+
+                byte[] fileBytes = zis.readAllBytes();
+                if (fileBytes.length > 512 * 1024) continue; // Skip >512KB binary/large files
+
+                String content = new String(fileBytes, StandardCharsets.UTF_8);
+                if (content.indexOf('\0') >= 0) continue; // Skip binary files
+
+                String blobHeader = "blob " + fileBytes.length + "\0";
+                byte[] blobFull = new byte[blobHeader.length() + fileBytes.length];
+                System.arraycopy(blobHeader.getBytes(StandardCharsets.UTF_8), 0, blobFull, 0, blobHeader.length());
+                System.arraycopy(fileBytes, 0, blobFull, blobHeader.length(), fileBytes.length);
+                String blobSha = sha1Hex(blobFull);
+
+                if (!gitObjects.existsByRepositoryIdAndSha(repo.getId(), blobSha)) {
+                    gitObjects.save(new GitObject(repo, blobSha, "blob", blobFull));
+                }
+
+                String fileName = relPath.contains("/") ? relPath.substring(relPath.lastIndexOf('/') + 1) : relPath;
+                String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.') + 1) : "";
+                files.save(new RepositoryFile(
+                        repo,
+                        "main",
+                        relPath,
+                        fileName,
+                        ext,
+                        (long) fileBytes.length,
+                        commitSha,
+                        blobSha,
+                        content,
+                        fileBytes,
+                        false,
+                        user
+                ));
+                importedFiles++;
+                if (importedFiles >= 200) break;
+            }
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", "Failed to unpack repository archive: " + e.getMessage()));
+        }
+
+        commits.save(new RepositoryCommit(
+                repo,
+                commitSha,
+                null,
+                commitSha,
+                "Import repository from " + rawUrl + " (" + importedFiles + " files)",
+                user.getUsername(),
+                user.getEmail(),
+                user.getUsername(),
+                user.getEmail(),
+                LocalDateTime.now()
+        ));
+        gitRefs.save(new GitRef(repo, "refs/heads/main", commitSha));
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("id", repo.getId());
+        result.put("name", repo.getName());
+        result.put("description", repo.getDescription());
+        result.put("isPrivate", repo.isPrivate());
+        result.put("ownerUsername", user.getUsername());
+        result.put("importedFiles", importedFiles);
+        result.put("commitSha", commitSha);
+        return ResponseEntity.status(HttpStatus.CREATED).body(result);
     }
 }
