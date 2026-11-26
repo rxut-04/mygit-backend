@@ -19,4 +19,7 @@ public interface PullRequestRepository extends JpaRepository<PullRequest, Long> 
 
     @Query("SELECT COALESCE(MAX(pr.prNumber), 0) + 1 FROM PullRequest pr WHERE pr.repository.id = :repositoryId")
     Integer getNextPrNumber(Long repositoryId);
+
+    @Query("SELECT pr FROM PullRequest pr JOIN FETCH pr.repository r JOIN FETCH pr.author WHERE r.owner.id = :userId OR pr.author.id = :userId ORDER BY pr.createdAt DESC")
+    List<PullRequest> findAllRelatedToUser(@org.springframework.data.repository.query.Param("userId") Long userId);
 }

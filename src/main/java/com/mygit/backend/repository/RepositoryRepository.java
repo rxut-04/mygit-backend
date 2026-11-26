@@ -18,4 +18,6 @@ public interface RepositoryRepository extends JpaRepository<Repository, Long> {
     Optional<Repository> findByOwnerUsernameAndName(String username, String name);
 
     List<Repository> findByName(String name);
+
+    long countByParentRepositoryId(Long parentRepositoryId);
 }

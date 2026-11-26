@@ -23,6 +23,18 @@ public class User {
     @Column(nullable = false, length = 255)
     private String passwordHash;
 
+    @Column(length = 120)
+    private String fullName;
+
+    @Column(length = 500)
+    private String bio;
+
+    @Column(length = 120)
+    private String location;
+
+    @Column(length = 255)
+    private String website;
+
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
@@ -74,5 +86,37 @@ public class User {
 
     public LocalDateTime getCreatedAt() {
         return createdAt;
+    }
+
+    public String getFullName() {
+        return fullName;
+    }
+
+    public void setFullName(String fullName) {
+        this.fullName = fullName;
+    }
+
+    public String getBio() {
+        return bio;
+    }
+
+    public void setBio(String bio) {
+        this.bio = bio;
+    }
+
+    public String getLocation() {
+        return location;
+    }
+
+    public void setLocation(String location) {
+        this.location = location;
+    }
+
+    public String getWebsite() {
+        return website;
+    }
+
+    public void setWebsite(String website) {
+        this.website = website;
     }
 }

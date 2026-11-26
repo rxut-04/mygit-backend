@@ -22,4 +22,7 @@ public interface IssueRepository extends JpaRepository<Issue, Long> {
     Integer getNextIssueNumber(@Param("repoId") Long repoId);
 
     long countByRepositoryIdAndStatus(Long repositoryId, String status);
+
+    @Query("SELECT i FROM Issue i JOIN FETCH i.repository r JOIN FETCH i.author WHERE r.owner.id = :userId OR i.author.id = :userId ORDER BY i.createdAt DESC")
+    List<Issue> findAllRelatedToUser(@Param("userId") Long userId);
 }
