@@ -44,6 +44,7 @@ public class SecurityConfig {
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/commits/**", "/api/repos/*/*/commits/**").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/issues/**", "/api/repos/*/*/issues/**").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/star", "/api/repos/*/*/star").permitAll()
+                        .requestMatchers(org.springframework.http.HttpMethod.POST, "/api/repos/*/chat", "/api/repos/*/*/chat").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/users/*/contributions", "/api/user/contributions").permitAll()
                         .anyRequest().authenticated()
                 )
