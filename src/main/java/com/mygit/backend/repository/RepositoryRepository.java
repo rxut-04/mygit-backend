@@ -20,4 +20,14 @@ public interface RepositoryRepository extends JpaRepository<Repository, Long> {
     List<Repository> findByName(String name);
 
     long countByParentRepositoryId(Long parentRepositoryId);
+
+    @org.springframework.data.jpa.repository.Query("""
+        SELECT r FROM Repository r JOIN FETCH r.owner o
+        WHERE r.isPrivate = false
+          AND (:q IS NULL OR :q = '' OR LOWER(r.name) LIKE LOWER(CONCAT('%', :q, '%'))
+               OR LOWER(COALESCE(r.description, '')) LIKE LOWER(CONCAT('%', :q, '%'))
+               OR LOWER(o.username) LIKE LOWER(CONCAT('%', :q, '%')))
+        ORDER BY r.updatedAt DESC
+    """)
+    List<Repository> searchPublicRepositories(@org.springframework.data.repository.query.Param("q") String q);
 }

@@ -73,6 +73,29 @@ public class RepositoryController {
     }
 
     /**
+     * Searches public repositories across all users (no authentication required).
+     */
+    @GetMapping(value = "/api/repos/public", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<List<Map<String, Object>>> searchPublicRepositories(
+            @RequestParam(name = "q", required = false, defaultValue = "") String q
+    ) {
+        List<Repository> found = repos.searchPublicRepositories(q.trim());
+        List<Map<String, Object>> result = found.stream().limit(40).map(r -> {
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("id", r.getId());
+            m.put("name", r.getName());
+            m.put("description", r.getDescription());
+            m.put("isPrivate", r.isPrivate());
+            m.put("ownerUsername", r.getOwner().getUsername());
+            m.put("starsCount", stars.countByRepositoryId(r.getId()));
+            m.put("forksCount", repos.countByParentRepositoryId(r.getId()));
+            m.put("updatedAt", r.getUpdatedAt());
+            return m;
+        }).toList();
+        return ResponseEntity.ok(result);
+    }
+
+    /**
      * Creates a new repository owned by the authenticated user.
      */
     @PostMapping(value = "/api/repos", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)

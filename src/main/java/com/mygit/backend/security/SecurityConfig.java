@@ -33,6 +33,7 @@ public class SecurityConfig {
                         .requestMatchers("/api/health").permitAll()
                         .requestMatchers("/error").permitAll()
                         .requestMatchers("/h2-console/**").permitAll()
+                        .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/public", "/api/repos/*", "/api/repos/*/*").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/refs", "/api/repos/*/*/refs").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/objects/**", "/api/repos/*/*/objects/**").permitAll()
                         .requestMatchers(org.springframework.http.HttpMethod.GET, "/api/repos/*/files", "/api/repos/*/*/files").permitAll()
