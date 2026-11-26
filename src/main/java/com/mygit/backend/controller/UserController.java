@@ -41,16 +41,14 @@ public class UserController {
         User targetUser = null;
         if (username != null && !username.isBlank()) {
             targetUser = users.findByUsername(username).orElse(null);
-        } else if (principal != null) {
+        }
+        if (targetUser == null && principal != null) {
             targetUser = users.findById(principal.getId()).orElse(null);
         }
 
-        List<Object[]> rows;
-        if (targetUser != null) {
-            rows = repoCommits.getContributionsByUserId(targetUser.getId());
-        } else {
-            rows = repoCommits.getAllContributions();
-        }
+        List<Object[]> rows = targetUser != null
+                ? repoCommits.getContributionsByUserId(targetUser.getId())
+                : List.of();
 
         Map<String, Integer> daily = new LinkedHashMap<>();
         int total = 0;
@@ -63,29 +61,33 @@ public class UserController {
             }
         }
 
-        // Calculate simple current streak and longest streak
+        // Calculate accurate consecutive-day currentStreak and longestStreak
         int currentStreak = 0;
         int longestStreak = 0;
         int tempStreak = 0;
 
         LocalDate today = LocalDate.now();
-        LocalDate check = today;
+        LocalDate check = daily.containsKey(today.toString()) ? today : today.minusDays(1);
         while (daily.containsKey(check.toString())) {
             currentStreak++;
             check = check.minusDays(1);
         }
 
+        LocalDate prevDay = null;
         for (Map.Entry<String, Integer> entry : daily.entrySet()) {
-            if (entry.getValue() > 0) {
+            if (entry.getValue() <= 0) continue;
+            LocalDate currDay = LocalDate.parse(entry.getKey());
+            if (prevDay != null && prevDay.plusDays(1).equals(currDay)) {
                 tempStreak++;
-                if (tempStreak > longestStreak) longestStreak = tempStreak;
             } else {
-                tempStreak = 0;
+                tempStreak = 1;
             }
+            if (tempStreak > longestStreak) longestStreak = tempStreak;
+            prevDay = currDay;
         }
 
         Map<String, Object> resp = new LinkedHashMap<>();
-        resp.put("username", targetUser != null ? targetUser.getUsername() : (principal != null ? principal.getUsername() : "all"));
+        resp.put("username", targetUser != null ? targetUser.getUsername() : "");
         resp.put("totalCommits", total);
         resp.put("currentStreak", currentStreak);
         resp.put("longestStreak", Math.max(longestStreak, currentStreak));
