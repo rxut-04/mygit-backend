@@ -35,14 +35,14 @@ public class User {
     @Column(length = 255)
     private String website;
 
-    @Column(nullable = false)
-    private boolean emailOnPr = true;
+    @Column(columnDefinition = "boolean default true")
+    private Boolean emailOnPr = true;
 
-    @Column(nullable = false)
-    private boolean emailOnMention = true;
+    @Column(columnDefinition = "boolean default true")
+    private Boolean emailOnMention = true;
 
-    @Column(nullable = false)
-    private boolean weeklyDigest = false;
+    @Column(columnDefinition = "boolean default false")
+    private Boolean weeklyDigest = false;
 
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt;
@@ -130,7 +130,7 @@ public class User {
     }
 
     public boolean isEmailOnPr() {
-        return emailOnPr;
+        return emailOnPr == null || emailOnPr;
     }
 
     public void setEmailOnPr(boolean emailOnPr) {
@@ -138,7 +138,7 @@ public class User {
     }
 
     public boolean isEmailOnMention() {
-        return emailOnMention;
+        return emailOnMention == null || emailOnMention;
     }
 
     public void setEmailOnMention(boolean emailOnMention) {
@@ -146,7 +146,7 @@ public class User {
     }
 
     public boolean isWeeklyDigest() {
-        return weeklyDigest;
+        return Boolean.TRUE.equals(weeklyDigest);
     }
 
     public void setWeeklyDigest(boolean weeklyDigest) {
