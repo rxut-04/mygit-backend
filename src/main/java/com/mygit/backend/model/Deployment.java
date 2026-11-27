@@ -30,6 +30,9 @@ public class Deployment {
     @Column(length = 120)
     private String outputDir = "";
 
+    @Column(length = 120)
+    private String entryFile = "index.html";
+
     @Column(length = 500)
     private String liveUrl;
 
@@ -69,6 +72,8 @@ public class Deployment {
     public void setStatus(String status) { this.status = status; }
     public String getOutputDir() { return outputDir; }
     public void setOutputDir(String outputDir) { this.outputDir = outputDir; }
+    public String getEntryFile() { return entryFile != null && !entryFile.isBlank() ? entryFile : "index.html"; }
+    public void setEntryFile(String entryFile) { this.entryFile = entryFile; }
     public String getLiveUrl() { return liveUrl; }
     public void setLiveUrl(String liveUrl) { this.liveUrl = liveUrl; }
     public String getErrorSummary() { return errorSummary; }

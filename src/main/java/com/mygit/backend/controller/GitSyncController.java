@@ -47,6 +47,9 @@ public class GitSyncController {
     private RepositoryFileRepository repoFiles;
 
     @Autowired
+    private DeploymentController deploymentController;
+
+    @Autowired
     private RepositoryCommitRepository repoCommits;
 
     @Autowired
@@ -252,6 +255,9 @@ public class GitSyncController {
             if (payload.files() == null || payload.files().isEmpty()) {
                 unpackCommitTreeToFiles(repo, branch, payload.target_sha(), principal);
             }
+            try {
+                deploymentController.autoDeployIfEligible(repo, branch);
+            } catch (Exception ignored) {}
         }
 
         return ResponseEntity.ok(Map.of(
@@ -832,6 +838,10 @@ public class GitSyncController {
                 java.time.LocalDateTime.now()
         );
         repoCommits.save(commit);
+
+        try {
+            deploymentController.autoDeployIfEligible(repo, branch);
+        } catch (Exception ignored) {}
 
         return ResponseEntity.ok(Map.of(
                 "path", rawPath,

@@ -1,5 +1,7 @@
 package com.mygit.backend.controller;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mygit.backend.model.*;
 import com.mygit.backend.repository.*;
 import com.mygit.backend.security.CustomUser;
@@ -14,7 +16,12 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 
@@ -26,6 +33,8 @@ public class DeploymentController {
     @Autowired private RepositoryCommitRepository commits;
     @Autowired private DeploymentRepository deployments;
     @Autowired private DeploymentLogRepository deploymentLogs;
+
+    private final ObjectMapper mapper = new ObjectMapper();
 
     private Repository resolveRepository(String name, String owner, CustomUser principal) {
         String cleanName = name.endsWith(".git") ? name.substring(0, name.length() - 4) : name;
@@ -56,6 +65,7 @@ public class DeploymentController {
         m.put("framework", d.getFramework());
         m.put("status", d.getStatus());
         m.put("outputDir", d.getOutputDir());
+        m.put("entryFile", d.getEntryFile());
         m.put("liveUrl", d.getLiveUrl());
         m.put("errorSummary", d.getErrorSummary());
         m.put("durationMs", d.getDurationMs());
@@ -72,6 +82,26 @@ public class DeploymentController {
         m.put("message", l.getMessage());
         m.put("createdAt", l.getCreatedAt());
         return m;
+    }
+
+    /**
+     * Auto-deploys on push if the repository already has a deployment or a static/prebuilt entry point on main.
+     */
+    @Transactional
+    public void autoDeployIfEligible(Repository repo, String branch) {
+        if (repo == null) return;
+        String targetBranch = (branch != null && !branch.isBlank()) ? branch : "main";
+        boolean hasExisting = !deployments.findByRepositoryIdOrderByCreatedAtDesc(repo.getId()).isEmpty();
+        if (!hasExisting && !"main".equalsIgnoreCase(targetBranch)) return;
+
+        List<RepositoryFile> repoFiles = files.findByRepositoryIdAndBranchName(repo.getId(), targetBranch);
+        boolean looksWeb = repoFiles.stream().anyMatch(f -> {
+            String p = f.getFilePath().toLowerCase();
+            return p.endsWith("index.html") || p.endsWith("package.json");
+        });
+        if (hasExisting || looksWeb) {
+            executeDeployment(repo, targetBranch, true);
+        }
     }
 
     @Transactional
@@ -96,11 +126,15 @@ public class DeploymentController {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Only repository owner can deploy"));
         }
 
-        long startMs = System.currentTimeMillis();
         String branch = (body != null && body.get("branch") != null && !body.get("branch").isBlank())
                 ? body.get("branch")
                 : "main";
+        Map<String, Object> result = executeDeployment(repo, branch, false);
+        return ResponseEntity.ok(result);
+    }
 
+    private Map<String, Object> executeDeployment(Repository repo, String branch, boolean isAuto) {
+        long startMs = System.currentTimeMillis();
         List<RepositoryCommit> repoCommits = commits.findByRepositoryIdOrderByAuthoredAtDesc(repo.getId());
         String latestSha = repoCommits.isEmpty() ? null : repoCommits.get(0).getCommitSha();
 
@@ -109,7 +143,9 @@ public class DeploymentController {
         int seq = 1;
 
         logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                "Initializing mygit Pages deployment for " + repo.getOwner().getUsername() + "/" + repo.getName() + " (branch: " + branch + ")")));
+                (isAuto ? "[Auto-Deploy on push] " : "")
+                        + "Initializing mygit Pages deployment for "
+                        + repo.getOwner().getUsername() + "/" + repo.getName() + " (branch: " + branch + ")")));
 
         List<RepositoryFile> repoFiles = files.findByRepositoryIdAndBranchName(repo.getId(), branch);
         if (repoFiles.isEmpty()) {
@@ -128,79 +164,128 @@ public class DeploymentController {
             dep.setDurationMs(Math.max(10L, System.currentTimeMillis() - startMs));
             dep.setFinishedAt(LocalDateTime.now());
             deployments.save(dep);
-            return ResponseEntity.ok(Map.of(
+            return Map.of(
                     "deployment", toDeploymentMap(dep),
                     "logs", logs.stream().map(this::toLogMap).toList()
-            ));
+            );
         }
 
-        Set<String> paths = new HashSet<>();
-        RepositoryFile packageJson = null;
+        Map<String, RepositoryFile> byLowerPath = new LinkedHashMap<>();
+        List<RepositoryFile> htmlFiles = new ArrayList<>();
+        List<RepositoryFile> pkgFiles = new ArrayList<>();
         for (RepositoryFile f : repoFiles) {
-            paths.add(f.getFilePath().toLowerCase());
-            if ("package.json".equalsIgnoreCase(f.getFilePath())) {
-                packageJson = f;
-            }
+            String lp = f.getFilePath().toLowerCase();
+            byLowerPath.put(lp, f);
+            if (lp.endsWith(".html") || lp.endsWith(".htm")) htmlFiles.add(f);
+            if (lp.equals("package.json") || lp.endsWith("/package.json")) pkgFiles.add(f);
         }
 
         String detectedFramework = "unknown";
         String outputDir = null;
+        String entryFile = "index.html";
         String errorSummary = null;
 
-        if (paths.contains("dist/index.html")) {
-            detectedFramework = "prebuilt-spa";
-            outputDir = "dist";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected pre-built bundle at dist/index.html.")));
-        } else if (paths.contains("build/index.html")) {
-            detectedFramework = "prebuilt-spa";
-            outputDir = "build";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected pre-built bundle at build/index.html.")));
-        } else if (paths.contains("out/index.html")) {
-            detectedFramework = "nextjs-export";
-            outputDir = "out";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected static export at out/index.html.")));
-        } else if (paths.contains("index.html") && packageJson == null) {
+        // 1. Check standard & nested prebuilt output directories first (dist/, build/, out/)
+        RepositoryFile prebuilt = findFirstMatching(byLowerPath, List.of(
+                "dist/index.html", "build/index.html", "out/index.html"
+        ));
+        if (prebuilt == null) {
+            for (RepositoryFile hf : htmlFiles) {
+                String lp = hf.getFilePath().toLowerCase();
+                if (lp.endsWith("/dist/index.html") || lp.endsWith("/build/index.html") || lp.endsWith("/out/index.html")) {
+                    prebuilt = hf;
+                    break;
+                }
+            }
+        }
+
+        if (prebuilt != null) {
+            detectedFramework = prebuilt.getFilePath().toLowerCase().contains("out/") ? "nextjs-export" : "prebuilt-spa";
+            outputDir = parentDir(prebuilt.getFilePath());
+            entryFile = fileNameOnly(prebuilt.getFilePath());
+            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
+                    "Detected pre-built bundle at '" + prebuilt.getFilePath() + "'.")));
+        } else if (byLowerPath.containsKey("index.html") && pkgFiles.isEmpty()) {
             detectedFramework = "static";
             outputDir = "";
+            entryFile = "index.html";
             logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected static HTML entry point at index.html.")));
-        } else if (paths.contains("public/index.html") && packageJson == null) {
+        } else if (byLowerPath.containsKey("docs/index.html") && pkgFiles.isEmpty()) {
+            detectedFramework = "static";
+            outputDir = "docs";
+            entryFile = "index.html";
+            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected static HTML entry point at docs/index.html.")));
+        } else if (byLowerPath.containsKey("public/index.html") && pkgFiles.isEmpty()) {
             detectedFramework = "static";
             outputDir = "public";
+            entryFile = "index.html";
             logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected static HTML entry point at public/index.html.")));
-        } else if (packageJson != null) {
-            String pkg = packageJson.getContentText() != null ? packageJson.getContentText().toLowerCase() : "";
-            if (pkg.contains("\"vite\"")) detectedFramework = "vite";
-            else if (pkg.contains("\"next\"")) detectedFramework = "nextjs";
-            else if (pkg.contains("\"react-scripts\"") || pkg.contains("\"react\"")) detectedFramework = "react";
-            else detectedFramework = "node";
-
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                    "Detected package.json (" + detectedFramework + " project).")));
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "WARN",
-                    "Checking for compiled output directory (dist/, build/, or out/)...")));
-
-            if (paths.contains("index.html") && pkg.contains("\"vite\"")) {
-                logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "WARN",
-                        "Root index.html references unbundled TypeScript/JSX modules (src/main.tsx) which browsers cannot execute directly without 'npm run build'.")));
-            }
-
-            errorSummary = "Detected unbuilt " + detectedFramework.toUpperCase() + " project without a compiled dist/, build/, or out/ folder. "
-                    + "Run 'npm run build' locally and push the generated dist/ folder (or connect an external Node build worker) so mygit Pages can serve the compiled bundle.";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
         } else {
-            errorSummary = "No web entry point (index.html) found in root, public/, dist/, build/, or out/. Add an index.html file to deploy this repository as a live site.";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
+            // Ambiguous / nested / custom HTML / unbuilt JS project -> invoke OpenRouter AI Project Detector
+            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
+                    "Running AI Project Detector (OpenRouter) across " + repoFiles.size() + " files...")));
+
+            AiDetectionResult ai = detectProjectWithAi(repo, repoFiles, pkgFiles);
+            if (ai != null) {
+                detectedFramework = ai.framework;
+                logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, ai.deployable ? "INFO" : "WARN",
+                        "AI Detector (" + ai.model + "): " + ai.reason)));
+                if (ai.deployable && ai.entryFile != null && !ai.entryFile.isBlank()) {
+                    String candidateFull = (ai.outputDir != null && !ai.outputDir.isBlank())
+                            ? ai.outputDir.replaceAll("/+$", "") + "/" + ai.entryFile
+                            : ai.entryFile;
+                    RepositoryFile resolved = byLowerPath.get(candidateFull.toLowerCase());
+                    if (resolved != null) {
+                        outputDir = parentDir(resolved.getFilePath());
+                        entryFile = fileNameOnly(resolved.getFilePath());
+                        logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
+                                "Resolved entry file '" + resolved.getFilePath() + "' (outputDir: '" + outputDir + "').")));
+                    } else {
+                        errorSummary = "AI detector suggested '" + candidateFull + "', which does not exist in branch '" + branch + "'.";
+                        logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
+                    }
+                } else {
+                    errorSummary = ai.reason;
+                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
+                }
+            } else {
+                // Deterministic fallback if OpenRouter key is missing or unreachable
+                if (!pkgFiles.isEmpty()) {
+                    RepositoryFile pkgFile = pkgFiles.get(0);
+                    String pkg = pkgFile.getContentText() != null ? pkgFile.getContentText().toLowerCase() : "";
+                    if (pkg.contains("\"vite\"")) detectedFramework = "vite";
+                    else if (pkg.contains("\"next\"")) detectedFramework = "nextjs";
+                    else if (pkg.contains("\"react-scripts\"") || pkg.contains("\"react\"")) detectedFramework = "react";
+                    else detectedFramework = "node";
+
+                    errorSummary = "Detected unbuilt " + detectedFramework.toUpperCase()
+                            + " project (" + pkgFile.getFilePath() + ") without a compiled dist/, build/, or out/ folder. "
+                            + "Run 'npm run build' locally and push the generated dist/ folder so mygit Pages can serve it.";
+                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
+                } else if (htmlFiles.size() == 1) {
+                    RepositoryFile onlyHtml = htmlFiles.get(0);
+                    detectedFramework = "static";
+                    outputDir = parentDir(onlyHtml.getFilePath());
+                    entryFile = fileNameOnly(onlyHtml.getFilePath());
+                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
+                            "Auto-selected single HTML entry point '" + onlyHtml.getFilePath() + "'.")));
+                } else {
+                    errorSummary = "No web entry point (index.html) found in root, public/, docs/, dist/, build/, or out/. Add an index.html file to deploy.";
+                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
+                }
+            }
         }
 
         dep.setFramework(detectedFramework);
         if (errorSummary == null) {
             String livePath = "/pages/" + repo.getOwner().getUsername() + "/" + repo.getName() + "/";
             logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                    "Configuring SPA route fallback and MIME content headers...")));
+                    "Configuring HTML <base> asset rewriting, MIME headers, and SPA fallback...")));
             logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "SUCCESS",
                     "Deployment LIVE at " + livePath)));
             dep.setStatus("LIVE");
-            dep.setOutputDir(outputDir);
+            dep.setOutputDir(outputDir != null ? outputDir : "");
+            dep.setEntryFile(entryFile);
             dep.setLiveUrl(livePath);
         } else {
             dep.setStatus("FAILED");
@@ -211,10 +296,100 @@ public class DeploymentController {
         dep.setFinishedAt(LocalDateTime.now());
         deployments.save(dep);
 
-        return ResponseEntity.ok(Map.of(
+        return Map.of(
                 "deployment", toDeploymentMap(dep),
                 "logs", logs.stream().map(this::toLogMap).toList()
-        ));
+        );
+    }
+
+    private static class AiDetectionResult {
+        boolean deployable;
+        String framework;
+        String outputDir;
+        String entryFile;
+        String reason;
+        String model;
+    }
+
+    private AiDetectionResult detectProjectWithAi(Repository repo, List<RepositoryFile> repoFiles, List<RepositoryFile> pkgFiles) {
+        String apiKey = System.getenv("OPENROUTER_API_KEY");
+        if (apiKey == null || apiKey.isBlank()) return null;
+        String model = System.getenv("OPENROUTER_MODEL");
+        if (model == null || model.isBlank()) model = "nvidia/nemotron-3-ultra-550b-a55b:free";
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Repository: ").append(repo.getOwner().getUsername()).append("/").append(repo.getName()).append("\nFiles:\n");
+        for (int i = 0; i < Math.min(repoFiles.size(), 80); i++) {
+            sb.append("- ").append(repoFiles.get(i).getFilePath()).append("\n");
+        }
+        for (int i = 0; i < Math.min(pkgFiles.size(), 2); i++) {
+            RepositoryFile p = pkgFiles.get(i);
+            String txt = p.getContentText() != null ? p.getContentText() : "";
+            sb.append("\n").append(p.getFilePath()).append(":\n")
+              .append(txt, 0, Math.min(txt.length(), 1500)).append("\n");
+        }
+
+        String prompt = "You are a static-site deployment detector for mygit Pages (which serves pre-built HTML/CSS/JS bundles directly without running npm build on the server).\n"
+                + "Analyze the file list and package.json below. Return ONLY valid JSON (no markdown fences) with keys:\n"
+                + "{\"deployable\": boolean, \"framework\": string, \"outputDir\": string, \"entryFile\": string, \"reason\": string}\n"
+                + "Rules:\n"
+                + "- deployable=true ONLY if there is a ready-to-serve HTML entry point (e.g. static HTML files, docs/index.html, or prebuilt dist/build/out folder).\n"
+                + "- deployable=false if it is an unbuilt React/Vite/Next/Angular/Vue source project missing dist/build/out, OR a non-web backend/CLI repo with no HTML.\n"
+                + "- outputDir should be the folder containing entryFile (\"\" for repo root).\n\n"
+                + sb;
+
+        try {
+            Map<String, Object> payload = Map.of(
+                    "model", model,
+                    "messages", List.of(Map.of("role", "user", "content", prompt))
+            );
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+            HttpRequest req = HttpRequest.newBuilder(URI.create("https://openrouter.ai/api/v1/chat/completions"))
+                    .timeout(Duration.ofSeconds(25))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + apiKey)
+                    .header("HTTP-Referer", "https://the-only-git-platform-you-need.netlify.app")
+                    .header("X-Title", "mygit")
+                    .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload)))
+                    .build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() < 200 || resp.statusCode() >= 300) return null;
+
+            JsonNode root = mapper.readTree(resp.body());
+            String content = root.path("choices").path(0).path("message").path("content").asText("").trim();
+            int start = content.indexOf('{');
+            int end = content.lastIndexOf('}');
+            if (start < 0 || end <= start) return null;
+            JsonNode json = mapper.readTree(content.substring(start, end + 1));
+
+            AiDetectionResult res = new AiDetectionResult();
+            res.deployable = json.path("deployable").asBoolean(false);
+            res.framework = json.path("framework").asText("unknown");
+            res.outputDir = json.path("outputDir").asText("");
+            res.entryFile = json.path("entryFile").asText("index.html");
+            res.reason = json.path("reason").asText("Analyzed by AI Project Detector.");
+            res.model = model;
+            return res;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private RepositoryFile findFirstMatching(Map<String, RepositoryFile> map, List<String> candidates) {
+        for (String c : candidates) {
+            if (map.containsKey(c.toLowerCase())) return map.get(c.toLowerCase());
+        }
+        return null;
+    }
+
+    private String parentDir(String path) {
+        int idx = path.lastIndexOf('/');
+        return idx > 0 ? path.substring(0, idx) : "";
+    }
+
+    private String fileNameOnly(String path) {
+        int idx = path.lastIndexOf('/');
+        return idx >= 0 ? path.substring(idx + 1) : path;
     }
 
     @Transactional(readOnly = true)
@@ -293,6 +468,7 @@ public class DeploymentController {
         Deployment liveDep = deployments.findFirstByRepositoryIdAndStatusOrderByCreatedAtDesc(r.getId(), "LIVE").orElse(null);
         String branch = liveDep != null ? liveDep.getBranch() : "main";
         String outputDir = liveDep != null && liveDep.getOutputDir() != null ? liveDep.getOutputDir() : "";
+        String entryFile = liveDep != null ? liveDep.getEntryFile() : "index.html";
 
         List<RepositoryFile> repoFiles = files.findByRepositoryIdAndBranchName(r.getId(), branch);
         if (repoFiles.isEmpty()) {
@@ -303,30 +479,60 @@ public class DeploymentController {
         String reqUri = request.getRequestURI();
         String relPath = reqUri.length() > prefix.length() ? reqUri.substring(prefix.length()) : "";
         if (relPath.startsWith("/")) relPath = relPath.substring(1);
-        if (relPath.isEmpty()) relPath = "index.html";
+        if (relPath.isEmpty()) relPath = entryFile;
 
         String targetPath = outputDir.isEmpty() ? relPath : outputDir + "/" + relPath;
         RepositoryFile matched = findFileIgnoreCase(repoFiles, targetPath);
 
         // SPA fallback if no file extension
         if (matched == null && !relPath.contains(".")) {
-            String fallbackPath = outputDir.isEmpty() ? "index.html" : outputDir + "/index.html";
+            String fallbackPath = outputDir.isEmpty() ? entryFile : outputDir + "/" + entryFile;
             matched = findFileIgnoreCase(repoFiles, fallbackPath);
         }
 
+        // Custom 404.html fallback if present
         if (matched == null) {
+            String custom404 = outputDir.isEmpty() ? "404.html" : outputDir + "/404.html";
+            RepositoryFile f404 = findFileIgnoreCase(repoFiles, custom404);
+            if (f404 != null) {
+                String html = f404.getContentText() != null ? rewriteHtmlPaths(f404.getContentText(), owner, repo) : "";
+                return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                        .contentType(MediaType.TEXT_HTML)
+                        .body(html.getBytes(StandardCharsets.UTF_8));
+            }
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .contentType(MediaType.TEXT_HTML)
                     .body("<h1>404 - File not found in mygit Pages</h1>".getBytes(StandardCharsets.UTF_8));
         }
 
-        byte[] content = matched.getContentBytes() != null
-                ? matched.getContentBytes()
-                : (matched.getContentText() != null ? matched.getContentText().getBytes(StandardCharsets.UTF_8) : new byte[0]);
+        String mime = detectMimeType(matched.getFilePath());
+        byte[] content;
+        if (mime.startsWith("text/html") && matched.getContentText() != null) {
+            content = rewriteHtmlPaths(matched.getContentText(), owner, repo).getBytes(StandardCharsets.UTF_8);
+        } else {
+            content = matched.getContentBytes() != null
+                    ? matched.getContentBytes()
+                    : (matched.getContentText() != null ? matched.getContentText().getBytes(StandardCharsets.UTF_8) : new byte[0]);
+        }
 
         return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_TYPE, detectMimeType(matched.getFilePath()))
+                .header(HttpHeaders.CONTENT_TYPE, mime)
                 .body(content);
+    }
+
+    /**
+     * Rewrites root-relative src="/..." and href="/..." paths and injects <base> so Vite/React/static sites
+     * load assets cleanly under /pages/{owner}/{repo}/.
+     */
+    private String rewriteHtmlPaths(String html, String owner, String repo) {
+        String base = "/pages/" + owner + "/" + repo + "/";
+        String out = html
+                .replaceAll("(src|href)=([\"'])/(?!/)", "$1=$2" + base)
+                .replace(base + "pages/", "/pages/");
+        if (!out.toLowerCase().contains("<base ")) {
+            out = out.replaceFirst("(?i)<head>", "<head><base href=\"" + base + "\">");
+        }
+        return out;
     }
 
     private RepositoryFile findFileIgnoreCase(List<RepositoryFile> list, String path) {
