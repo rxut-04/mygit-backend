@@ -16,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.io.ByteArrayInputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -24,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.zip.InflaterInputStream;
 
 @RestController
 public class DeploymentController {
@@ -33,6 +35,7 @@ public class DeploymentController {
     @Autowired private RepositoryCommitRepository commits;
     @Autowired private DeploymentRepository deployments;
     @Autowired private DeploymentLogRepository deploymentLogs;
+    @Autowired private GitObjectRepository gitObjects;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -511,15 +514,16 @@ public class DeploymentController {
         }
 
         String mime = detectMimeType(matched.getFilePath());
+        byte[] raw = resolveRawFileBytes(r, matched);
         byte[] content;
-        if (mime.startsWith("text/html") && matched.getContentText() != null) {
-            content = rewriteHtmlPaths(matched.getContentText(), owner, repo).getBytes(StandardCharsets.UTF_8);
-        } else if (mime.startsWith("text/css") && matched.getContentText() != null) {
-            content = rewriteCssPaths(matched.getContentText(), owner, repo).getBytes(StandardCharsets.UTF_8);
+        if (mime.startsWith("text/html")) {
+            String html = new String(raw, StandardCharsets.UTF_8);
+            content = rewriteHtmlPaths(html, owner, repo).getBytes(StandardCharsets.UTF_8);
+        } else if (mime.startsWith("text/css")) {
+            String css = new String(raw, StandardCharsets.UTF_8);
+            content = rewriteCssPaths(css, owner, repo).getBytes(StandardCharsets.UTF_8);
         } else {
-            content = matched.getContentBytes() != null
-                    ? matched.getContentBytes()
-                    : (matched.getContentText() != null ? matched.getContentText().getBytes(StandardCharsets.UTF_8) : new byte[0]);
+            content = raw;
         }
 
         return ResponseEntity.ok()
@@ -528,16 +532,51 @@ public class DeploymentController {
     }
 
     /**
-     * Rewrites root-relative src="/..." and href="/..." paths and injects <base> so Vite/React/static sites
-     * load assets cleanly under /pages/{owner}/{repo}/.
+     * Resolves full untruncated bytes for a repository file, inflating the underlying git blob object
+     * when binary bytes are not cached on RepositoryFile or when contentText was truncated during CLI push.
+     */
+    private byte[] resolveRawFileBytes(Repository r, RepositoryFile matched) {
+        if (matched.getContentBytes() != null && matched.getContentBytes().length > 0) {
+            return matched.getContentBytes();
+        }
+        String text = matched.getContentText();
+        boolean needsBlob = matched.isBinary()
+                || text == null
+                || (matched.getFileSize() != null && matched.getFileSize() > text.getBytes(StandardCharsets.UTF_8).length);
+        if (needsBlob && matched.getBlobSha() != null && !matched.getBlobSha().isBlank()) {
+            GitObject obj = gitObjects.findByRepositoryIdAndSha(r.getId(), matched.getBlobSha()).orElse(null);
+            if (obj != null && obj.getData() != null) {
+                try (InflaterInputStream iis = new InflaterInputStream(new ByteArrayInputStream(obj.getData()))) {
+                    byte[] decompressed = iis.readAllBytes();
+                    int nullIdx = -1;
+                    for (int i = 0; i < decompressed.length; i++) {
+                        if (decompressed[i] == 0) {
+                            nullIdx = i;
+                            break;
+                        }
+                    }
+                    if (nullIdx >= 0 && nullIdx + 1 <= decompressed.length) {
+                        return Arrays.copyOfRange(decompressed, nullIdx + 1, decompressed.length);
+                    }
+                } catch (Exception ignored) {}
+            }
+        }
+        return text != null ? text.getBytes(StandardCharsets.UTF_8) : new byte[0];
+    }
+
+    /**
+     * Rewrites root-relative src="/..." and href="/..." paths, injects <base>, and normalizes
+     * client-side SPA router paths so Vite/React SPAs without a custom basename render at /pages/{owner}/{repo}/.
      */
     private String rewriteHtmlPaths(String html, String owner, String repo) {
-        String base = "/pages/" + owner + "/" + repo + "/";
+        String prefix = "/pages/" + owner + "/" + repo;
+        String base = prefix + "/";
         String out = html
                 .replaceAll("(src|href)=([\"'])/(?!/)", "$1=$2" + base)
                 .replace(base + "pages/", "/pages/");
         if (!out.toLowerCase().contains("<base ")) {
-            String baseTag = "<base href=\"" + base + "\">";
+            String spaFix = "<script>(function(){var p=\"" + prefix + "\",l=window.location.pathname;if(l===p||l.indexOf(p+\"/\")===0){var s=l.slice(p.length)||\"/\";window.history.replaceState(window.history.state,\"\",s+window.location.search+window.location.hash);}})();</script>";
+            String baseTag = "<base href=\"" + base + "\">" + spaFix;
             String updated = out.replaceFirst("(?i)<head(\\s[^>]*)?>", "$0" + baseTag);
             out = updated.equals(out) ? baseTag + out : updated;
         }
@@ -572,8 +611,19 @@ public class DeploymentController {
         if (p.endsWith(".svg")) return "image/svg+xml";
         if (p.endsWith(".png")) return "image/png";
         if (p.endsWith(".jpg") || p.endsWith(".jpeg")) return "image/jpeg";
+        if (p.endsWith(".gif")) return "image/gif";
         if (p.endsWith(".webp")) return "image/webp";
         if (p.endsWith(".ico")) return "image/x-icon";
+        if (p.endsWith(".woff2")) return "font/woff2";
+        if (p.endsWith(".woff")) return "font/woff";
+        if (p.endsWith(".ttf")) return "font/ttf";
+        if (p.endsWith(".otf")) return "font/otf";
+        if (p.endsWith(".eot")) return "application/vnd.ms-fontobject";
+        if (p.endsWith(".mp4")) return "video/mp4";
+        if (p.endsWith(".webm")) return "video/webm";
+        if (p.endsWith(".wasm")) return "application/wasm";
+        if (p.endsWith(".xml")) return "application/xml; charset=utf-8";
+        if (p.endsWith(".webmanifest")) return "application/manifest+json; charset=utf-8";
         if (p.endsWith(".txt") || p.endsWith(".md")) return "text/plain; charset=utf-8";
         return "application/octet-stream";
     }
