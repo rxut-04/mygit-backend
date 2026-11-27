@@ -575,7 +575,16 @@ public class DeploymentController {
                 .replaceAll("(src|href)=([\"'])/(?!/)", "$1=$2" + base)
                 .replace(base + "pages/", "/pages/");
         if (!out.toLowerCase().contains("<base ")) {
-            String spaFix = "<script>(function(){var p=\"" + prefix + "\",l=window.location.pathname;if(l===p||l.indexOf(p+\"/\")===0){var s=l.slice(p.length)||\"/\";window.history.replaceState(window.history.state,\"\",s+window.location.search+window.location.hash);}})();</script>";
+            String spaFix = "<script>(function(){"
+                    + "var p=\"" + prefix + "\",l=window.location.pathname;"
+                    + "if(l===p||l.indexOf(p+\"/\")===0){var s=l.slice(p.length)||\"/\";window.history.replaceState(window.history.state,\"\",s+window.location.search+window.location.hash);}"
+                    + "function rw(v){return(typeof v===\"string\"&&v.charAt(0)===\"/\"&&v.charAt(1)!==\"/\"&&v.indexOf(p+\"/\")!==0&&v.indexOf(\"/pages/\")!==0&&v.indexOf(\"/api/\")!==0)?p+v:v;}"
+                    + "var sa=Element.prototype.setAttribute;"
+                    + "Element.prototype.setAttribute=function(n,v){var k=String(n).toLowerCase();if((k===\"src\"||k===\"poster\")&&this.tagName!==\"A\"){v=rw(v);}return sa.call(this,n,v);};"
+                    + "function wp(C,k){if(!C||!C.prototype)return;var d=Object.getOwnPropertyDescriptor(C.prototype,k);if(d&&d.set&&d.get){Object.defineProperty(C.prototype,k,{configurable:true,enumerable:d.enumerable,get:function(){return d.get.call(this);},set:function(v){return d.set.call(this,rw(v));}});}}"
+                    + "wp(window.HTMLImageElement,\"src\");wp(window.HTMLMediaElement,\"src\");wp(window.HTMLVideoElement,\"poster\");wp(window.HTMLSourceElement,\"src\");"
+                    + "if(window.fetch){var of=window.fetch;window.fetch=function(i,o){return of.call(this,typeof i===\"string\"?rw(i):i,o);};}"
+                    + "})();</script>";
             String baseTag = "<base href=\"" + base + "\">" + spaFix;
             String updated = out.replaceFirst("(?i)<head(\\s[^>]*)?>", "$0" + baseTag);
             out = updated.equals(out) ? baseTag + out : updated;
