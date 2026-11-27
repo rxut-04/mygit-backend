@@ -142,6 +142,29 @@ public class GitSyncController {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Only the repository owner can push"));
         }
 
+        // Guard against pushing node_modules/ or oversized files (> 25 MB)
+        if (payload.files() != null) {
+            for (PushPayload.PushedFile pf : payload.files()) {
+                if (pf.path() != null) {
+                    String norm = pf.path().replace("\\", "/").toLowerCase();
+                    if (norm.equals("node_modules") || norm.startsWith("node_modules/") || norm.contains("/node_modules/")) {
+                        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                                "error", "Push rejected: 'node_modules/' must not be pushed. Add 'node_modules/' to .gitignore and recommit."
+                        ));
+                    }
+                }
+            }
+        }
+        if (payload.objects() != null) {
+            for (PushPayload.PushedObject obj : payload.objects()) {
+                if (obj.content_hex() != null && obj.content_hex().length() > 50 * 1024 * 1024) {
+                    return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                            "error", "Push rejected: object '" + obj.sha() + "' exceeds 25 MB per-file limit."
+                    ));
+                }
+            }
+        }
+
         HexFormat hex = HexFormat.of();
 
         // 1. Ingest all objects
