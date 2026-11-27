@@ -460,9 +460,14 @@ public class DeploymentController {
     ) {
         Repository r = repos.findByOwnerUsernameAndName(owner, repo).orElse(null);
         if (r == null || r.isPrivate()) {
+            String reason = r == null
+                    ? "Repository not found."
+                    : "Repository is private — make it public in repository settings to view mygit Pages.";
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .contentType(MediaType.TEXT_HTML)
-                    .body("<h1>404 - Site not found or repository is private</h1>".getBytes(StandardCharsets.UTF_8));
+                    .body(("<!doctype html><html><body style=\"font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;padding:48px;text-align:center\">"
+                            + "<h2>404 — mygit Pages unavailable</h2><p style=\"color:#8b949e\">" + reason + "</p></body></html>")
+                            .getBytes(StandardCharsets.UTF_8));
         }
 
         Deployment liveDep = deployments.findFirstByRepositoryIdAndStatusOrderByCreatedAtDesc(r.getId(), "LIVE").orElse(null);
@@ -509,6 +514,8 @@ public class DeploymentController {
         byte[] content;
         if (mime.startsWith("text/html") && matched.getContentText() != null) {
             content = rewriteHtmlPaths(matched.getContentText(), owner, repo).getBytes(StandardCharsets.UTF_8);
+        } else if (mime.startsWith("text/css") && matched.getContentText() != null) {
+            content = rewriteCssPaths(matched.getContentText(), owner, repo).getBytes(StandardCharsets.UTF_8);
         } else {
             content = matched.getContentBytes() != null
                     ? matched.getContentBytes()
@@ -530,9 +537,21 @@ public class DeploymentController {
                 .replaceAll("(src|href)=([\"'])/(?!/)", "$1=$2" + base)
                 .replace(base + "pages/", "/pages/");
         if (!out.toLowerCase().contains("<base ")) {
-            out = out.replaceFirst("(?i)<head>", "<head><base href=\"" + base + "\">");
+            String baseTag = "<base href=\"" + base + "\">";
+            String updated = out.replaceFirst("(?i)<head(\\s[^>]*)?>", "$0" + baseTag);
+            out = updated.equals(out) ? baseTag + out : updated;
         }
         return out;
+    }
+
+    /**
+     * Rewrites root-relative url('/...') and url("/...") in CSS files under /pages/{owner}/{repo}/.
+     */
+    private String rewriteCssPaths(String css, String owner, String repo) {
+        String base = "/pages/" + owner + "/" + repo + "/";
+        return css
+                .replaceAll("url\\(([\"']?)/(?!/)", "url($1" + base)
+                .replace(base + "pages/", "/pages/");
     }
 
     private RepositoryFile findFileIgnoreCase(List<RepositoryFile> list, String path) {
