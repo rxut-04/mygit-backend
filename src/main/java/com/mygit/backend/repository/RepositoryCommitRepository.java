@@ -41,6 +41,9 @@ public interface RepositoryCommitRepository extends JpaRepository<RepositoryComm
     @Query("SELECT rc FROM RepositoryCommit rc JOIN FETCH rc.repository r WHERE r.owner.id = :ownerId ORDER BY rc.authoredAt DESC")
     List<RepositoryCommit> findRecentByOwnerId(@Param("ownerId") Long ownerId, org.springframework.data.domain.Pageable pageable);
 
+    @Query("SELECT rc FROM RepositoryCommit rc JOIN FETCH rc.repository r WHERE r.owner.id = :ownerId AND rc.authoredAt >= :since ORDER BY rc.authoredAt ASC")
+    List<RepositoryCommit> findByOwnerIdSince(@Param("ownerId") Long ownerId, @Param("since") java.time.LocalDateTime since);
+
     @Query("SELECT COUNT(rc) FROM RepositoryCommit rc WHERE rc.repository.owner.id = :ownerId")
     long countByOwnerId(@Param("ownerId") Long ownerId);
 

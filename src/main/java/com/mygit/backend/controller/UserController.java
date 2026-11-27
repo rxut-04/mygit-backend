@@ -1,20 +1,24 @@
 package com.mygit.backend.controller;
 
+import com.mygit.backend.model.RepositoryCommit;
 import com.mygit.backend.model.User;
 import com.mygit.backend.repository.RepositoryCommitRepository;
 import com.mygit.backend.repository.UserRepository;
 import com.mygit.backend.security.CustomUser;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.*;
 
 @RestController
@@ -36,6 +40,7 @@ public class UserController {
     }, produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<?> getContributions(
             @PathVariable(required = false) String username,
+            @RequestParam(required = false) String tz,
             @AuthenticationPrincipal CustomUser principal
     ) {
         User targetUser = null;
@@ -46,27 +51,34 @@ public class UserController {
             targetUser = users.findById(principal.getId()).orElse(null);
         }
 
-        List<Object[]> rows = targetUser != null
-                ? repoCommits.getContributionsByUserId(targetUser.getId())
-                : List.of();
-
-        Map<String, Integer> daily = new LinkedHashMap<>();
-        int total = 0;
-        for (Object[] r : rows) {
-            if (r != null && r.length >= 2) {
-                String day = String.valueOf(r[0]);
-                int count = ((Number) r[1]).intValue();
-                daily.put(day, count);
-                total += count;
-            }
+        ZoneId zone = ZoneOffset.UTC;
+        if (tz != null && !tz.isBlank()) {
+            try {
+                zone = ZoneId.of(tz.trim());
+            } catch (Exception ignored) {}
         }
 
-        // Calculate accurate consecutive-day currentStreak and longestStreak
+        LocalDateTime sinceUtc = LocalDateTime.now(ZoneOffset.UTC).minusDays(366);
+        List<RepositoryCommit> commits = targetUser != null
+                ? repoCommits.findByOwnerIdSince(targetUser.getId(), sinceUtc)
+                : List.of();
+
+        Map<String, Integer> daily = new TreeMap<>();
+        int total = 0;
+        for (RepositoryCommit c : commits) {
+            LocalDateTime ts = c.getAuthoredAt();
+            if (ts == null) continue;
+            String day = ts.atOffset(ZoneOffset.UTC).atZoneSameInstant(zone).toLocalDate().toString();
+            daily.merge(day, 1, Integer::sum);
+            total++;
+        }
+
+        // Calculate accurate consecutive-day currentStreak and longestStreak in the user's timezone
         int currentStreak = 0;
         int longestStreak = 0;
         int tempStreak = 0;
 
-        LocalDate today = LocalDate.now();
+        LocalDate today = LocalDate.now(zone);
         LocalDate check = daily.containsKey(today.toString()) ? today : today.minusDays(1);
         while (daily.containsKey(check.toString())) {
             currentStreak++;

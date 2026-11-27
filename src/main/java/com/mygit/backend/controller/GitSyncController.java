@@ -647,7 +647,7 @@ public class GitSyncController {
         String authorEmail = null;
         String committerName = null;
         String committerEmail = null;
-        java.time.LocalDateTime authoredAt = java.time.LocalDateTime.now();
+        java.time.LocalDateTime authoredAt = java.time.LocalDateTime.now(java.time.ZoneOffset.UTC);
 
         String[] parts = commitText.split("\n\n", 2);
         String header = parts[0];
@@ -666,6 +666,17 @@ public class GitSyncController {
                 if (emailStart != -1 && emailEnd > emailStart) {
                     authorName = authorLine.substring(0, emailStart).trim();
                     authorEmail = authorLine.substring(emailStart + 1, emailEnd).trim();
+                    String tail = authorLine.substring(emailEnd + 1).trim();
+                    if (!tail.isEmpty()) {
+                        String[] tsParts = tail.split("\\s+");
+                        try {
+                            long epochSec = Long.parseLong(tsParts[0]);
+                            authoredAt = java.time.LocalDateTime.ofInstant(
+                                    java.time.Instant.ofEpochSecond(epochSec),
+                                    java.time.ZoneOffset.UTC
+                            );
+                        } catch (NumberFormatException ignored) {}
+                    }
                 } else {
                     authorName = authorLine;
                 }
@@ -858,7 +869,7 @@ public class GitSyncController {
                 repo, commitSha, null, blobSha, message,
                 uploader.getUsername(), uploader.getEmail(),
                 uploader.getUsername(), uploader.getEmail(),
-                java.time.LocalDateTime.now()
+                java.time.LocalDateTime.now(java.time.ZoneOffset.UTC)
         );
         repoCommits.save(commit);
 
