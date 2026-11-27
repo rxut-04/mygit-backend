@@ -17,14 +17,18 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.*;
+import java.util.zip.DeflaterOutputStream;
 import java.util.zip.InflaterInputStream;
 
 @RestController
@@ -36,6 +40,7 @@ public class DeploymentController {
     @Autowired private DeploymentRepository deployments;
     @Autowired private DeploymentLogRepository deploymentLogs;
     @Autowired private GitObjectRepository gitObjects;
+    @Autowired private UserRepository users;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -134,6 +139,139 @@ public class DeploymentController {
                 : "main";
         Map<String, Object> result = executeDeployment(repo, branch, false);
         return ResponseEntity.ok(result);
+    }
+
+    /**
+     * AI Self-Healing Deployment endpoint: analyzes a failed deployment, generates & commits
+     * targeted repository file fixes (e.g., entry index.html, base path / asset fixes), and
+     * immediately re-runs deployment to produce a LIVE URL.
+     */
+    @Transactional
+    @PostMapping(value = {
+            "/api/repos/{name}/deployments/{id}/ai-fix",
+            "/api/repos/{owner}/{name}/deployments/{id}/ai-fix"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> aiFixAndRedeploy(
+            @PathVariable String name,
+            @PathVariable(required = false) String owner,
+            @PathVariable Long id,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
+        }
+        Repository repo = resolveRepository(name, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+        if (!repo.getOwner().getId().equals(principal.getId())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Only repository owner can apply AI fixes"));
+        }
+
+        Deployment dep = deployments.findById(id).orElse(null);
+        if (dep == null || !dep.getRepository().getId().equals(repo.getId())) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Deployment not found"));
+        }
+
+        String branch = dep.getBranch() != null && !dep.getBranch().isBlank() ? dep.getBranch() : "main";
+        List<RepositoryFile> repoFiles = files.findByRepositoryIdAndBranchName(repo.getId(), branch);
+        if (repoFiles.isEmpty()) {
+            repoFiles = files.findByRepositoryId(repo.getId());
+        }
+        List<DeploymentLog> logs = deploymentLogs.findByDeploymentIdOrderBySeqAsc(dep.getId());
+
+        AiFixPlan plan = generateAiFixPlan(repo, dep, logs, repoFiles);
+        if (plan == null || plan.changes.isEmpty()) {
+            String diagnosis = plan != null && plan.diagnosis != null
+                    ? plan.diagnosis
+                    : "AI could not automatically patch this repository without a local build step.";
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("fixed", false);
+            resp.put("diagnosis", diagnosis);
+            resp.put("unfixableReason", plan != null ? plan.unfixableReason : diagnosis);
+            resp.put("appliedChanges", List.of());
+            return ResponseEntity.ok(resp);
+        }
+
+        User uploader = users.findById(principal.getId()).orElse(repo.getOwner());
+        String commitMessage = (plan.commitMessage != null && !plan.commitMessage.isBlank())
+                ? plan.commitMessage
+                : "ai-fix: repair mygit Pages deployment";
+        String commitSha = sha1Hex("commit ", (repo.getName() + ":" + branch + ":" + System.nanoTime()).getBytes(StandardCharsets.UTF_8));
+
+        List<String> appliedPaths = new ArrayList<>();
+        String lastBlobSha = "";
+
+        for (AiFileChange ch : plan.changes) {
+            if (ch.path == null) continue;
+            String cleanPath = ch.path.trim().replace("\\", "/").replaceAll("^/+", "");
+            if (cleanPath.isBlank() || cleanPath.contains("..")) continue;
+
+            if ("delete".equalsIgnoreCase(ch.action)) {
+                files.findByRepositoryIdAndBranchNameAndFilePath(repo.getId(), branch, cleanPath)
+                        .ifPresent(files::delete);
+                appliedPaths.add("deleted " + cleanPath);
+                continue;
+            }
+
+            String content = ch.content != null ? ch.content : "";
+            byte[] contentBytes = content.getBytes(StandardCharsets.UTF_8);
+            String blobSha = sha1Hex("blob " + contentBytes.length + "\0", contentBytes);
+            lastBlobSha = blobSha;
+
+            if (!gitObjects.existsByRepositoryIdAndSha(repo.getId(), blobSha)) {
+                try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                     DeflaterOutputStream dos = new DeflaterOutputStream(baos)) {
+                    dos.write(("blob " + contentBytes.length + "\0").getBytes(StandardCharsets.ISO_8859_1));
+                    dos.write(contentBytes);
+                    dos.finish();
+                    gitObjects.save(new GitObject(repo, blobSha, "blob", baos.toByteArray()));
+                } catch (Exception ignored) {}
+            }
+
+            String fileName = cleanPath.contains("/") ? cleanPath.substring(cleanPath.lastIndexOf('/') + 1) : cleanPath;
+            String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf('.') + 1) : "";
+
+            RepositoryFile repoFile = files
+                    .findByRepositoryIdAndBranchNameAndFilePath(repo.getId(), branch, cleanPath)
+                    .orElse(new RepositoryFile(
+                            repo, branch, cleanPath, fileName, ext, (long) contentBytes.length,
+                            commitSha, blobSha, content, null, false, uploader
+                    ));
+            repoFile.setCommitSha(commitSha);
+            repoFile.setBlobSha(blobSha);
+            repoFile.setFileSize((long) contentBytes.length);
+            repoFile.setContentText(content);
+            repoFile.setBinary(false);
+            files.save(repoFile);
+            appliedPaths.add(cleanPath);
+        }
+
+        if (appliedPaths.isEmpty()) {
+            return ResponseEntity.ok(Map.of(
+                    "fixed", false,
+                    "diagnosis", "No valid file paths were produced to patch.",
+                    "appliedChanges", List.of()
+            ));
+        }
+
+        commits.save(new RepositoryCommit(
+                repo, commitSha, dep.getCommitSha(), lastBlobSha, commitMessage,
+                uploader.getUsername(), uploader.getEmail(),
+                uploader.getUsername(), uploader.getEmail(),
+                LocalDateTime.now(ZoneOffset.UTC)
+        ));
+
+        Map<String, Object> redeploy = executeDeployment(repo, branch, false);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("fixed", true);
+        resp.put("diagnosis", plan.diagnosis != null ? plan.diagnosis : "Applied AI deployment fix and redeployed.");
+        resp.put("commitMessage", commitMessage);
+        resp.put("commitSha", commitSha);
+        resp.put("appliedChanges", appliedPaths);
+        resp.put("deployment", redeploy.get("deployment"));
+        resp.put("logs", redeploy.get("logs"));
+        return ResponseEntity.ok(resp);
     }
 
     private Map<String, Object> executeDeployment(Repository repo, String branch, boolean isAuto) {
@@ -375,6 +513,152 @@ public class DeploymentController {
             return res;
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    private static class AiFileChange {
+        String path;
+        String action;
+        String content;
+    }
+
+    private static class AiFixPlan {
+        String diagnosis;
+        String commitMessage;
+        String unfixableReason;
+        List<AiFileChange> changes = new ArrayList<>();
+    }
+
+    private AiFixPlan generateAiFixPlan(
+            Repository repo,
+            Deployment dep,
+            List<DeploymentLog> logs,
+            List<RepositoryFile> repoFiles
+    ) {
+        List<RepositoryFile> htmlFiles = new ArrayList<>();
+        List<RepositoryFile> pkgFiles = new ArrayList<>();
+        for (RepositoryFile f : repoFiles) {
+            String lp = f.getFilePath().toLowerCase();
+            if (lp.endsWith(".html") || lp.endsWith(".htm")) htmlFiles.add(f);
+            if (lp.equals("package.json") || lp.endsWith("/package.json")) pkgFiles.add(f);
+        }
+
+        // Try OpenRouter AI Fix Planner first
+        String apiKey = System.getenv("OPENROUTER_API_KEY");
+        if (apiKey != null && !apiKey.isBlank()) {
+            String model = System.getenv("OPENROUTER_MODEL");
+            if (model == null || model.isBlank()) model = "nvidia/nemotron-3-ultra-550b-a55b:free";
+
+            StringBuilder ctx = new StringBuilder();
+            ctx.append("Repository: ").append(repo.getOwner().getUsername()).append("/").append(repo.getName())
+               .append(" (branch: ").append(dep.getBranch()).append(")\n");
+            ctx.append("Failed Deployment Error: ").append(dep.getErrorSummary()).append("\nLogs:\n");
+            for (DeploymentLog l : logs) {
+                ctx.append("[").append(l.getLevel()).append("] ").append(l.getMessage()).append("\n");
+            }
+            ctx.append("\nFiles:\n");
+            for (int i = 0; i < Math.min(repoFiles.size(), 80); i++) {
+                ctx.append("- ").append(repoFiles.get(i).getFilePath()).append("\n");
+            }
+            for (RepositoryFile f : repoFiles) {
+                String lp = f.getFilePath().toLowerCase();
+                if (lp.endsWith("package.json") || lp.endsWith(".html") || lp.startsWith("vite.config")) {
+                    byte[] raw = resolveRawFileBytes(repo, f);
+                    String txt = new String(raw, StandardCharsets.UTF_8);
+                    ctx.append("\n--- ").append(f.getFilePath()).append(" ---\n")
+                       .append(txt, 0, Math.min(txt.length(), 2500)).append("\n");
+                }
+            }
+
+            String prompt = "You are an autonomous deployment repair engineer for mygit Pages.\n"
+                    + "mygit Pages serves static HTML/CSS/JS or prebuilt dist/build/out bundles directly at /pages/{owner}/{repo}/ (it does NOT run npm install or npm run build on the server).\n"
+                    + "Given the failed deployment below, decide if the repository can be fixed by creating/updating static files (e.g. creating index.html that loads/redirects to an existing .html entry file, fixing broken index.html asset paths, creating a clean static landing page from README, etc.).\n"
+                    + "If the project is an unbuilt React/Vite/Next/Angular/Vue TypeScript source project with NO dist/build/out bundle, set changes=[] and explain the exact local build command in unfixableReason.\n"
+                    + "Return ONLY valid JSON (no markdown fences) matching:\n"
+                    + "{\"diagnosis\": string, \"commitMessage\": string, \"unfixableReason\": string|null, \"changes\": [{\"path\": string, \"action\": \"upsert\"|\"delete\", \"content\": string}]}\n\n"
+                    + ctx;
+
+            try {
+                Map<String, Object> payload = Map.of(
+                        "model", model,
+                        "messages", List.of(Map.of("role", "user", "content", prompt))
+                );
+                HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+                HttpRequest req = HttpRequest.newBuilder(URI.create("https://openrouter.ai/api/v1/chat/completions"))
+                        .timeout(Duration.ofSeconds(30))
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", "Bearer " + apiKey)
+                        .header("HTTP-Referer", "https://the-only-git-platform-you-need.netlify.app")
+                        .header("X-Title", "mygit")
+                        .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload)))
+                        .build();
+                HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+                    JsonNode root = mapper.readTree(resp.body());
+                    String content = root.path("choices").path(0).path("message").path("content").asText("").trim();
+                    int start = content.indexOf('{');
+                    int end = content.lastIndexOf('}');
+                    if (start >= 0 && end > start) {
+                        JsonNode json = mapper.readTree(content.substring(start, end + 1));
+                        AiFixPlan plan = new AiFixPlan();
+                        plan.diagnosis = json.path("diagnosis").asText("AI analyzed the deployment failure.");
+                        plan.commitMessage = json.path("commitMessage").asText("ai-fix: repair mygit Pages deployment");
+                        if (!json.path("unfixableReason").isNull()) {
+                            plan.unfixableReason = json.path("unfixableReason").asText(null);
+                        }
+                        if (json.path("changes").isArray()) {
+                            for (JsonNode c : json.path("changes")) {
+                                AiFileChange fc = new AiFileChange();
+                                fc.path = c.path("path").asText("");
+                                fc.action = c.path("action").asText("upsert");
+                                fc.content = c.path("content").asText("");
+                                if (!fc.path.isBlank()) plan.changes.add(fc);
+                            }
+                        }
+                        if (!plan.changes.isEmpty() || (plan.unfixableReason != null && !plan.unfixableReason.isBlank())) {
+                            return plan;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Deterministic fallback if OpenRouter didn't return a plan
+        AiFixPlan fallback = new AiFixPlan();
+        if (!htmlFiles.isEmpty() && pkgFiles.isEmpty()) {
+            RepositoryFile target = htmlFiles.get(0);
+            String targetPath = target.getFilePath().replaceAll("^/+", "");
+            AiFileChange fc = new AiFileChange();
+            fc.path = "index.html";
+            fc.action = "upsert";
+            fc.content = "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n"
+                    + "  <meta http-equiv=\"refresh\" content=\"0; url=./" + targetPath + "\">\n"
+                    + "  <title>" + repo.getName() + "</title>\n</head>\n<body>\n"
+                    + "  <p>Redirecting to <a href=\"./" + targetPath + "\">" + targetPath + "</a>...</p>\n"
+                    + "  <script>window.location.replace(\"./" + targetPath + "\");</script>\n"
+                    + "</body>\n</html>\n";
+            fallback.diagnosis = "Added root index.html entry point redirecting to existing '" + targetPath + "'.";
+            fallback.commitMessage = "ai-fix: add root index.html entry for " + targetPath;
+            fallback.changes.add(fc);
+            return fallback;
+        }
+
+        fallback.diagnosis = "This repository requires a local build step (`npm run build`) to produce a static `dist/` or `build/` bundle before mygit Pages can host it.";
+        fallback.unfixableReason = "Run `npm run build`, then `mygit add dist && mygit commit -m \"build\" && mygit push origin " + dep.getBranch() + "`.";
+        return fallback;
+    }
+
+    private String sha1Hex(String header, byte[] body) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            md.update(header.getBytes(StandardCharsets.UTF_8));
+            md.update(body);
+            byte[] digest = md.digest();
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return UUID.randomUUID().toString().replace("-", "");
         }
     }
 
