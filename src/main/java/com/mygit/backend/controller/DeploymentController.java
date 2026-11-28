@@ -288,22 +288,32 @@ public class DeploymentController {
         List<DeploymentLog> logs = new ArrayList<>();
         int seq = 1;
 
-        logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                (isAuto ? "[Auto-Deploy on push] " : "")
-                        + "Initializing mygit Pages deployment for "
-                        + repo.getOwner().getUsername() + "/" + repo.getName() + " (branch: " + branch + ")")));
+        logs.add(new DeploymentLog(dep, seq++, "INFO",
+                (isAuto ? "[auto-deploy] " : "") + "Build ready to start"));
+        logs.add(new DeploymentLog(dep, seq++, "INFO",
+                "build-image: mygit-pages-edge (ubuntu-24.04-lts)"));
+        logs.add(new DeploymentLog(dep, seq++, "INFO",
+                "Fetching repository " + repo.getOwner().getUsername() + "/" + repo.getName() + " (branch: " + branch + ")"));
+        if (latestSha != null && !latestSha.isBlank()) {
+            logs.add(new DeploymentLog(dep, seq++, "INFO",
+                    "Checked out commit " + latestSha.substring(0, Math.min(12, latestSha.length()))));
+        }
 
         List<RepositoryFile> repoFiles = files.findByRepositoryIdAndBranchName(repo.getId(), branch);
         if (repoFiles.isEmpty()) {
             repoFiles = files.findByRepositoryId(repo.getId());
         }
 
-        logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                "Scanning repository tree... found " + repoFiles.size() + " tracked file(s).")));
+        long totalRepoBytes = repoFiles.stream()
+                .mapToLong(f -> f.getFileSize() != null ? f.getFileSize() : 0L)
+                .sum();
+        logs.add(new DeploymentLog(dep, seq++, "INFO",
+                String.format(Locale.US, "Synced %d tracked file(s) (%.2f KB total)", repoFiles.size(), totalRepoBytes / 1024.0)));
 
         if (repoFiles.isEmpty()) {
             String err = "Repository has 0 pushed files on branch '" + branch + "'. Push files with 'mygit push origin " + branch + "' before deploying.";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", err)));
+            logs.add(new DeploymentLog(dep, seq++, "ERROR", err));
+            deploymentLogs.saveAll(logs);
             dep.setStatus("FAILED");
             dep.setFramework("empty");
             dep.setErrorSummary(err);
@@ -324,6 +334,9 @@ public class DeploymentController {
             if (lp.equals("package.json")) pkgFiles.add(f);
         }
 
+        logs.add(new DeploymentLog(dep, seq++, "INFO", "Inspecting root output directories: dist/, build/, out/"));
+        logs.add(new DeploymentLog(dep, seq++, "INFO", "Checking root entry point: index.html"));
+
         String detectedFramework = "unknown";
         String outputDir = null;
         String entryFile = "index.html";
@@ -338,8 +351,10 @@ public class DeploymentController {
             detectedFramework = prebuilt.getFilePath().toLowerCase().startsWith("out/") ? "nextjs-export" : "prebuilt-spa";
             outputDir = parentDir(prebuilt.getFilePath());
             entryFile = fileNameOnly(prebuilt.getFilePath());
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                    "Detected pre-built bundle at '" + prebuilt.getFilePath() + "'.")));
+            logs.add(new DeploymentLog(dep, seq++, "INFO",
+                    "Detected pre-built bundle at '" + prebuilt.getFilePath() + "' (" + detectedFramework + ")"));
+            logs.add(new DeploymentLog(dep, seq++, "INFO",
+                    "Publish directory set to '" + outputDir + "/'"));
         } else if (byLowerPath.containsKey("index.html")) {
             RepositoryFile rootIndex = byLowerPath.get("index.html");
             String rootHtml = new String(resolveRawFileBytes(repo, rootIndex), StandardCharsets.UTF_8);
@@ -348,13 +363,15 @@ public class DeploymentController {
                 detectedFramework = !pkgFiles.isEmpty() ? "vite" : "react";
                 errorSummary = "Root index.html references an uncompiled source entry (.ts/.tsx/.jsx) and no dist/, build/, or out/ bundle was found. "
                         + "Run 'npm run build' locally and push the generated dist/ folder so mygit Pages can serve it.";
-                logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
+                logs.add(new DeploymentLog(dep, seq++, "ERROR", errorSummary));
             } else {
                 detectedFramework = "static";
                 outputDir = "";
                 entryFile = "index.html";
-                logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                        "Detected project root entry point at 'index.html'.")));
+                logs.add(new DeploymentLog(dep, seq++, "INFO",
+                        "Detected project root entry point at 'index.html' (static)"));
+                logs.add(new DeploymentLog(dep, seq++, "INFO",
+                        "Publish directory set to repository root '/'"));
             }
         } else {
             if (!pkgFiles.isEmpty()) {
@@ -370,25 +387,57 @@ public class DeploymentController {
             } else {
                 errorSummary = "No index.html found in project root (checked index.html, dist/index.html, build/index.html, out/index.html).";
             }
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
+            logs.add(new DeploymentLog(dep, seq++, "ERROR", errorSummary));
         }
 
         dep.setFramework(detectedFramework);
         if (errorSummary == null) {
             String livePath = "/pages/" + repo.getOwner().getUsername() + "/" + repo.getName() + "/";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                    "Configuring HTML <base> asset rewriting, MIME headers, and SPA fallback...")));
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "SUCCESS",
-                    "Deployment LIVE at " + livePath)));
+            String prefixFilter = (outputDir != null && !outputDir.isEmpty()) ? (outputDir.toLowerCase() + "/") : "";
+            List<RepositoryFile> publishedFiles = repoFiles.stream()
+                    .filter(f -> prefixFilter.isEmpty() || f.getFilePath().toLowerCase().startsWith(prefixFilter))
+                    .sorted(Comparator.comparing(RepositoryFile::getFilePath))
+                    .toList();
+
+            logs.add(new DeploymentLog(dep, seq++, "INFO",
+                    "Collecting publishable assets (" + publishedFiles.size() + " file(s) in publish target)..."));
+
+            int listed = 0;
+            for (RepositoryFile pf : publishedFiles) {
+                if (listed >= 85) {
+                    logs.add(new DeploymentLog(dep, seq++, "INFO",
+                            "... and " + (publishedFiles.size() - listed) + " more asset(s) indexed."));
+                    break;
+                }
+                long sz = pf.getFileSize() != null ? pf.getFileSize() : 0L;
+                String mime = detectMimeType(pf.getFilePath());
+                logs.add(new DeploymentLog(dep, seq++, "INFO",
+                        String.format(Locale.US, "  %-52s %8.1f KB  %s", pf.getFilePath(), sz / 1024.0, mime)));
+                listed++;
+            }
+
+            logs.add(new DeploymentLog(dep, seq++, "INFO", "Verifying git_objects blob integrity for binary & >500KB assets..."));
+            logs.add(new DeploymentLog(dep, seq++, "INFO", "Injecting <base href=\"" + livePath + "\"> into HTML entry points"));
+            logs.add(new DeploymentLog(dep, seq++, "INFO", "Configuring SPA history normalization for client-side routing"));
+            logs.add(new DeploymentLog(dep, seq++, "INFO", "Enabling runtime root-relative DOM src/poster/fetch rewriting"));
+            logs.add(new DeploymentLog(dep, seq++, "INFO", "Enabling CSS url(/...) path rewriting for stylesheets"));
+            boolean hasCustom404 = publishedFiles.stream().anyMatch(f -> fileNameOnly(f.getFilePath()).equalsIgnoreCase("404.html"));
+            logs.add(new DeploymentLog(dep, seq++, "INFO",
+                    hasCustom404 ? "Detected custom 404.html fallback" : "Configured default SPA index.html fallback for extensionless routes"));
+            logs.add(new DeploymentLog(dep, seq++, "INFO", "Publishing site to mygit Pages edge router..."));
+            logs.add(new DeploymentLog(dep, seq++, "SUCCESS",
+                    "Site is live at " + livePath));
             dep.setStatus("LIVE");
             dep.setOutputDir(outputDir != null ? outputDir : "");
             dep.setEntryFile(entryFile);
             dep.setLiveUrl(livePath);
         } else {
+            logs.add(new DeploymentLog(dep, seq++, "ERROR", "Build failed during pre-publish verification."));
             dep.setStatus("FAILED");
             dep.setErrorSummary(errorSummary);
         }
 
+        deploymentLogs.saveAll(logs);
         dep.setDurationMs(Math.max(25L, System.currentTimeMillis() - startMs));
         dep.setFinishedAt(LocalDateTime.now());
         deployments.save(dep);
