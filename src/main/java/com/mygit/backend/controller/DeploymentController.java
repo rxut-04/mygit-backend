@@ -430,9 +430,10 @@ public class DeploymentController {
                 + "Analyze the file list and package.json below. Return ONLY valid JSON (no markdown fences) with keys:\n"
                 + "{\"deployable\": boolean, \"framework\": string, \"outputDir\": string, \"entryFile\": string, \"reason\": string}\n"
                 + "Rules:\n"
-                + "- deployable=true ONLY if there is a ready-to-serve HTML entry point (e.g. static HTML files, docs/index.html, or prebuilt dist/build/out folder).\n"
-                + "- deployable=false if it is an unbuilt React/Vite/Next/Angular/Vue source project missing dist/build/out, OR a non-web backend/CLI repo with no HTML.\n"
-                + "- outputDir should be the folder containing entryFile (\"\" for repo root).\n\n"
+                + "- deployable=true ONLY if there is a ready-to-serve root index.html, dist/index.html, build/index.html, or out/index.html.\n"
+                + "- NEVER select nested subfolder HTML files (like docs/, templates/, examples/, node_modules/).\n"
+                + "- deployable=false if it is an unbuilt React/Vite/Next/Angular/Vue source project missing dist/build/out, OR a non-web backend/CLI repo (e.g. java-spring, python, go, node-api).\n"
+                + "- outputDir should be \"\", \"dist\", \"build\", or \"out\".\n\n"
                 + sb;
 
         try {
@@ -633,6 +634,140 @@ public class DeploymentController {
     private String fileNameOnly(String path) {
         int idx = path.lastIndexOf('/');
         return idx >= 0 ? path.substring(idx + 1) : path;
+    }
+
+    @Transactional(readOnly = true)
+    @GetMapping(value = {
+            "/api/repos/{name}/deployments/analyze",
+            "/api/repos/{owner}/{name}/deployments/analyze"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> analyzeProjectForDeployment(
+            @PathVariable String name,
+            @PathVariable(required = false) String owner,
+            @RequestParam(defaultValue = "main") String branch,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
+        Repository repo = resolveRepository(name, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+
+        List<RepositoryFile> repoFiles = files.findByRepositoryIdAndBranchName(repo.getId(), branch);
+        if (repoFiles.isEmpty()) {
+            repoFiles = files.findByRepositoryId(repo.getId());
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("branch", branch);
+        result.put("fileCount", repoFiles.size());
+
+        if (repoFiles.isEmpty()) {
+            result.put("deployable", false);
+            result.put("projectType", "Empty Repository");
+            result.put("framework", "empty");
+            result.put("entryPath", null);
+            result.put("outputDir", "");
+            result.put("aiPowered", false);
+            result.put("reason", "No files have been pushed to branch '" + branch + "' yet.");
+            result.put("suggestedFix", "Push your project files with a root index.html (or prebuilt dist/index.html) to deploy.");
+            return ResponseEntity.ok(result);
+        }
+
+        Map<String, RepositoryFile> byLowerPath = new LinkedHashMap<>();
+        List<RepositoryFile> pkgFiles = new ArrayList<>();
+        for (RepositoryFile f : repoFiles) {
+            String lp = f.getFilePath().toLowerCase();
+            byLowerPath.put(lp, f);
+            if (lp.equals("package.json")) pkgFiles.add(f);
+        }
+
+        RepositoryFile prebuilt = findFirstMatching(byLowerPath, List.of(
+                "dist/index.html", "build/index.html", "out/index.html"
+        ));
+        if (prebuilt != null) {
+            String outDir = parentDir(prebuilt.getFilePath());
+            String fw = prebuilt.getFilePath().toLowerCase().startsWith("out/") ? "nextjs-export" : "prebuilt-spa";
+            result.put("deployable", true);
+            result.put("projectType", fw.equals("nextjs-export") ? "Next.js Static Export" : "Prebuilt React / Vite SPA");
+            result.put("framework", fw);
+            result.put("entryPath", prebuilt.getFilePath());
+            result.put("outputDir", outDir);
+            result.put("aiPowered", false);
+            result.put("reason", "Detected ready-to-serve compiled bundle at '" + prebuilt.getFilePath() + "'.");
+            result.put("suggestedFix", null);
+            return ResponseEntity.ok(result);
+        }
+
+        if (byLowerPath.containsKey("index.html")) {
+            RepositoryFile rootIndex = byLowerPath.get("index.html");
+            String rootHtml = new String(resolveRawFileBytes(repo, rootIndex), StandardCharsets.UTF_8);
+            boolean hasUnbuiltModuleEntry = rootHtml.matches("(?is).*<script[^>]+src=[\"'][^\"']*\\.(tsx|ts|jsx)[\"'][^>]*>.*");
+            if (!hasUnbuiltModuleEntry) {
+                result.put("deployable", true);
+                result.put("projectType", "Static HTML / CSS / JS");
+                result.put("framework", "static");
+                result.put("entryPath", rootIndex.getFilePath());
+                result.put("outputDir", "");
+                result.put("aiPowered", false);
+                result.put("reason", "Detected valid project-root entry point at 'index.html'.");
+                result.put("suggestedFix", null);
+                return ResponseEntity.ok(result);
+            }
+            String fw = !pkgFiles.isEmpty() ? "vite" : "react";
+            result.put("deployable", false);
+            result.put("projectType", "Unbuilt React / Vite Source");
+            result.put("framework", fw);
+            result.put("entryPath", null);
+            result.put("outputDir", "");
+            result.put("aiPowered", false);
+            result.put("reason", "Root index.html references an uncompiled source entry (.ts/.tsx/.jsx) and no dist/, build/, or out/ bundle was found.");
+            result.put("suggestedFix", "Run `npm run build` locally and push the generated `dist/` folder so mygit Pages can serve it.");
+            return ResponseEntity.ok(result);
+        }
+
+        // Run OpenRouter AI Project Detector for any other project type (Java, Python, Node API, unbuilt JS, etc.)
+        AiDetectionResult ai = detectProjectWithAi(repo, repoFiles, pkgFiles);
+        if (ai != null) {
+            result.put("deployable", false);
+            result.put("projectType", ai.framework != null && !ai.framework.isBlank() ? ai.framework : "Non-Static Project");
+            result.put("framework", ai.framework);
+            result.put("entryPath", null);
+            result.put("outputDir", "");
+            result.put("aiPowered", true);
+            result.put("model", ai.model);
+            result.put("reason", ai.reason);
+            result.put("suggestedFix", !pkgFiles.isEmpty()
+                    ? "Run `npm run build` locally and push `dist/`, or add a root `index.html`."
+                    : "Add a root `index.html` (or prebuilt `dist/index.html`) to enable static hosting on mygit Pages.");
+            return ResponseEntity.ok(result);
+        }
+
+        // Deterministic fallback if OpenRouter is unreachable
+        String detectedFw = "other";
+        String projLabel = "Non-Static / Source Repository";
+        if (!pkgFiles.isEmpty()) {
+            String pkg = pkgFiles.get(0).getContentText() != null ? pkgFiles.get(0).getContentText().toLowerCase() : "";
+            if (pkg.contains("\"vite\"")) { detectedFw = "vite"; projLabel = "Unbuilt Vite Project"; }
+            else if (pkg.contains("\"next\"")) { detectedFw = "nextjs"; projLabel = "Unbuilt Next.js Project"; }
+            else if (pkg.contains("\"react\"")) { detectedFw = "react"; projLabel = "Unbuilt React Project"; }
+            else { detectedFw = "node"; projLabel = "Node.js Project"; }
+        } else if (byLowerPath.containsKey("pom.xml") || byLowerPath.containsKey("build.gradle")) {
+            detectedFw = "java"; projLabel = "Java / JVM Backend";
+        } else if (byLowerPath.containsKey("requirements.txt") || byLowerPath.containsKey("pyproject.toml")) {
+            detectedFw = "python"; projLabel = "Python Project";
+        }
+
+        result.put("deployable", false);
+        result.put("projectType", projLabel);
+        result.put("framework", detectedFw);
+        result.put("entryPath", null);
+        result.put("outputDir", "");
+        result.put("aiPowered", false);
+        result.put("reason", "No root index.html (or compiled dist/index.html, build/index.html, out/index.html) found.");
+        result.put("suggestedFix", !pkgFiles.isEmpty()
+                ? "Run `npm run build` locally and push `dist/`."
+                : "Add a root `index.html` to deploy this repository as a static site.");
+        return ResponseEntity.ok(result);
     }
 
     @Transactional(readOnly = true)
