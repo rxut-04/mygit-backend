@@ -38,27 +38,8 @@ public class PullRequestController {
 
     @Autowired
     private DiffService diffService;
-
-    private Repository resolveRepository(String repoName, String ownerName, CustomUser principal) {
-        String cleanName = repoName;
-        if (cleanName.endsWith(".mygit")) cleanName = cleanName.substring(0, cleanName.length() - 6);
-        if (cleanName.endsWith(".git")) cleanName = cleanName.substring(0, cleanName.length() - 4);
-
-        if (ownerName != null && !ownerName.isBlank()) {
-            User owner = users.findByUsername(ownerName).orElse(null);
-            if (owner != null) {
-                return repos.findByOwnerIdAndName(owner.getId(), cleanName).orElse(null);
-            }
-        }
-        if (principal != null) {
-            Repository userRepo = repos.findByOwnerIdAndName(principal.getId(), cleanName).orElse(null);
-            if (userRepo != null) return userRepo;
-        }
-        return repos.findByName(cleanName).stream()
-                .filter(r -> !r.isPrivate() || (principal != null && r.getOwner().getId().equals(principal.getId())))
-                .findFirst()
-                .orElse(null);
-    }
+    @Autowired
+    private com.mygit.backend.service.RepositoryLookupService repoLookup;
 
     public record CreatePrRequest(String title, String description, String sourceBranch, String targetBranch) {}
     public record AddCommentRequest(String commentText) {}
@@ -77,7 +58,7 @@ public class PullRequestController {
             @RequestParam(defaultValue = "ALL") String status,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -111,7 +92,7 @@ public class PullRequestController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
 
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -160,7 +141,7 @@ public class PullRequestController {
             @PathVariable Integer number,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -215,7 +196,7 @@ public class PullRequestController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required to merge"));
         }
 
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -314,7 +295,7 @@ public class PullRequestController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
 
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }

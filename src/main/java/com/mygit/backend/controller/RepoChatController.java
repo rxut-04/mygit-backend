@@ -30,27 +30,9 @@ public class RepoChatController {
     @Autowired private RepositoryRepository repos;
     @Autowired private RepositoryFileRepository files;
     @Autowired private RepositoryCommitRepository commits;
+    @Autowired private com.mygit.backend.service.RepositoryLookupService repoLookup;
 
     private final ObjectMapper mapper = new ObjectMapper();
-
-    private Repository resolveRepository(String name, String owner, CustomUser principal) {
-        String cleanName = name.endsWith(".git") ? name.substring(0, name.length() - 4) : name;
-        if (owner != null && !owner.isBlank()) {
-            Repository r = repos.findByOwnerUsernameAndName(owner, cleanName).orElse(null);
-            if (r != null && (!r.isPrivate() || (principal != null && r.getOwner().getId().equals(principal.getId())))) {
-                return r;
-            }
-            return null;
-        }
-        if (principal != null) {
-            Repository owned = repos.findByOwnerIdAndName(principal.getId(), cleanName).orElse(null);
-            if (owned != null) return owned;
-        }
-        return repos.findByName(cleanName).stream()
-                .filter(r -> !r.isPrivate() || (principal != null && r.getOwner().getId().equals(principal.getId())))
-                .findFirst()
-                .orElse(null);
-    }
 
     @Transactional(readOnly = true)
     @PostMapping(value = {
@@ -64,7 +46,7 @@ public class RepoChatController {
             @RequestBody Map<String, Object> body
     ) {
         long startMs = System.currentTimeMillis();
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found or access denied"));
         }

@@ -35,3 +35,6 @@ build/
 # Database files
 data/
 *.db
+
+# Local environment secrets
+.env

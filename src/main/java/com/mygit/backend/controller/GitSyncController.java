@@ -54,36 +54,8 @@ public class GitSyncController {
 
     @Autowired
     private com.mygit.backend.service.DiffService diffService;
-
-    private String cleanRepoName(String name) {
-        if (name == null) return "";
-        if (name.endsWith(".mygit")) {
-            return name.substring(0, name.length() - 6);
-        }
-        if (name.endsWith(".git")) {
-            return name.substring(0, name.length() - 4);
-        }
-        return name;
-    }
-
-    private Repository resolveRepository(String repoName, String ownerName, CustomUser principal) {
-        String cleanName = cleanRepoName(repoName);
-        if (ownerName != null && !ownerName.isBlank()) {
-            User owner = users.findByUsername(ownerName).orElse(null);
-            if (owner != null) {
-                return repos.findByOwnerIdAndName(owner.getId(), cleanName).orElse(null);
-            }
-        }
-        if (principal != null) {
-            Repository userRepo = repos.findByOwnerIdAndName(principal.getId(), cleanName).orElse(null);
-            if (userRepo != null) return userRepo;
-        }
-        // Fallback: search public repository with this name
-        return repos.findByName(cleanName).stream()
-                .filter(r -> !r.isPrivate() || (principal != null && r.getOwner().getId().equals(principal.getId())))
-                .findFirst()
-                .orElse(null);
-    }
+    @Autowired
+    private com.mygit.backend.service.RepositoryLookupService repoLookup;
 
     /**
      * Protocol: GET /refs -> map of ref names to commit SHAs
@@ -97,7 +69,7 @@ public class GitSyncController {
             @PathVariable(required = false) String owner,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -133,7 +105,7 @@ public class GitSyncController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required to push"));
         }
 
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -304,7 +276,7 @@ public class GitSyncController {
             @RequestParam(defaultValue = "main") String branch,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -338,7 +310,7 @@ public class GitSyncController {
             @PathVariable(required = false) String owner,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -378,7 +350,7 @@ public class GitSyncController {
             @RequestParam(defaultValue = "main") String branch,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
         }
@@ -437,7 +409,7 @@ public class GitSyncController {
             @PathVariable String sha,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
         }
@@ -465,7 +437,7 @@ public class GitSyncController {
             @PathVariable(required = false) String owner,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -504,7 +476,7 @@ public class GitSyncController {
             @PathVariable String commitSha,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -825,7 +797,7 @@ public class GitSyncController {
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
-        Repository repo = resolveRepository(repoName, owner, principal);
+        Repository repo = repoLookup.resolve(repoName, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }

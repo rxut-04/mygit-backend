@@ -39,25 +39,8 @@ public class RepositoryController {
     public record UpdateVisibilityReq(boolean isPrivate) {}
     public record TransferRepoReq(String newOwnerUsername) {}
 
-    private Repository resolveRepository(String repoName, String ownerName, CustomUser principal) {
-        String cleanName = repoName.trim();
-        if (cleanName.endsWith(".git")) cleanName = cleanName.substring(0, cleanName.length() - 4);
-
-        if (ownerName != null && !ownerName.isBlank()) {
-            User owner = users.findByUsername(ownerName).orElse(null);
-            if (owner != null) {
-                return repos.findByOwnerIdAndName(owner.getId(), cleanName).orElse(null);
-            }
-        }
-        if (principal != null) {
-            Repository userRepo = repos.findByOwnerIdAndName(principal.getId(), cleanName).orElse(null);
-            if (userRepo != null) return userRepo;
-        }
-        return repos.findByName(cleanName).stream()
-                .filter(r -> !r.isPrivate() || (principal != null && r.getOwner().getId().equals(principal.getId())))
-                .findFirst()
-                .orElse(null);
-    }
+    @Autowired
+    private com.mygit.backend.service.RepositoryLookupService repoLookup;
 
     /**
      * Lists repositories belonging to the authenticated user.
@@ -130,7 +113,7 @@ public class RepositoryController {
             @PathVariable(required = false) String owner,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -149,7 +132,7 @@ public class RepositoryController {
             @PathVariable(required = false) String owner,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -183,7 +166,7 @@ public class RepositoryController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required to star"));
         }
 
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -223,7 +206,7 @@ public class RepositoryController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required to fork"));
         }
 
-        Repository sourceRepo = resolveRepository(name, owner, principal);
+        Repository sourceRepo = repoLookup.resolve(name, owner, principal);
         if (sourceRepo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Source repository not found"));
         }
@@ -298,7 +281,7 @@ public class RepositoryController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
 
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -345,7 +328,7 @@ public class RepositoryController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
 
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -382,7 +365,7 @@ public class RepositoryController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
 
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -435,7 +418,7 @@ public class RepositoryController {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
 
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }

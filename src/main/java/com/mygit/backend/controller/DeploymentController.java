@@ -43,28 +43,10 @@ public class DeploymentController {
     @Autowired private DeploymentLogRepository deploymentLogs;
     @Autowired private GitObjectRepository gitObjects;
     @Autowired private UserRepository users;
+    @Autowired private com.mygit.backend.service.RepositoryLookupService repoLookup;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final Map<Long, CopyOnWriteArrayList<SseEmitter>> liveEmitters = new ConcurrentHashMap<>();
-
-    private Repository resolveRepository(String name, String owner, CustomUser principal) {
-        String cleanName = name.endsWith(".git") ? name.substring(0, name.length() - 4) : name;
-        if (owner != null && !owner.isBlank()) {
-            Repository r = repos.findByOwnerUsernameAndName(owner, cleanName).orElse(null);
-            if (r != null && (!r.isPrivate() || (principal != null && r.getOwner().getId().equals(principal.getId())))) {
-                return r;
-            }
-            return null;
-        }
-        if (principal != null) {
-            Repository owned = repos.findByOwnerIdAndName(principal.getId(), cleanName).orElse(null);
-            if (owned != null) return owned;
-        }
-        return repos.findByName(cleanName).stream()
-                .filter(r -> !r.isPrivate() || (principal != null && r.getOwner().getId().equals(principal.getId())))
-                .findFirst()
-                .orElse(null);
-    }
 
     private Map<String, Object> toDeploymentMap(Deployment d) {
         Map<String, Object> m = new LinkedHashMap<>();
@@ -134,7 +116,7 @@ public class DeploymentController {
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -168,7 +150,7 @@ public class DeploymentController {
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -699,7 +681,7 @@ public class DeploymentController {
             @RequestParam(defaultValue = "main") String branch,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -832,7 +814,7 @@ public class DeploymentController {
             @PathVariable(required = false) String owner,
             @AuthenticationPrincipal CustomUser principal
     ) {
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
@@ -870,7 +852,7 @@ public class DeploymentController {
         if (principal == null) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
         }
-        Repository repo = resolveRepository(name, owner, principal);
+        Repository repo = repoLookup.resolve(name, owner, principal);
         if (repo == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
         }
