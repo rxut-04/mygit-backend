@@ -45,6 +45,7 @@ public class DashboardController {
     @Autowired private NotificationStateRepository notificationStates;
     @Autowired private GitObjectRepository gitObjects;
     @Autowired private GitRefRepository gitRefs;
+    @Autowired private RepoAccessRequestRepository accessRequests;
 
     private static String sha256Hex(String input) {
         try {
@@ -301,6 +302,21 @@ public class DashboardController {
             notif.put("message", "@" + s.getUser().getUsername() + " starred your repository " + s.getRepository().getName());
             notif.put("timestamp", s.getCreatedAt());
             notif.put("unread", false);
+            notif.put("category", "all");
+            notifications.add(notif);
+        }
+
+        for (RepoAccessRequest ar : accessRequests.findByOwnerIdOrderByCreatedAtDesc(userId)) {
+            Map<String, Object> notif = new LinkedHashMap<>();
+            notif.put("id", "notif-access-" + ar.getId());
+            notif.put("type", "access_request");
+            notif.put("requestId", ar.getId());
+            notif.put("status", ar.getStatus());
+            notif.put("requester", ar.getRequester().getUsername());
+            notif.put("repo", ar.getRepository().getName());
+            notif.put("message", "@" + ar.getRequester().getUsername() + " requested access to " + ar.getRepository().getName() + " (" + ar.getStatus() + "): " + (ar.getMessage() != null ? ar.getMessage() : ""));
+            notif.put("timestamp", ar.getCreatedAt());
+            notif.put("unread", "PENDING".equalsIgnoreCase(ar.getStatus()));
             notif.put("category", "all");
             notifications.add(notif);
         }

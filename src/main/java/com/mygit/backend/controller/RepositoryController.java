@@ -35,6 +35,9 @@ public class RepositoryController {
     @Autowired
     private GitRefRepository gitRefs;
 
+    @Autowired
+    private RepoAccessRequestRepository accessRequests;
+
     public record UpdateRepoReq(String name, String description) {}
     public record UpdateVisibilityReq(boolean isPrivate) {}
     public record TransferRepoReq(String newOwnerUsername) {}
@@ -429,5 +432,80 @@ public class RepositoryController {
 
         repos.delete(repo);
         return ResponseEntity.ok(Map.of("message", "Repository deleted successfully"));
+    }
+
+    /**
+     * Request access to a public or private repository; sends a unified notification to the owner.
+     */
+    @Transactional
+    @PostMapping(value = {
+            "/api/repos/{name}/request-access",
+            "/api/repos/{owner}/{name}/request-access"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> requestRepositoryAccess(
+            @PathVariable String name,
+            @PathVariable(required = false) String owner,
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody(required = false) Map<String, String> body
+    ) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Sign in to request access to this repository"));
+        }
+        String cleanName = repoLookup.cleanRepoName(name);
+        Repository repo = (owner != null && !owner.isBlank())
+                ? repos.findByOwnerUsernameAndName(owner, cleanName).orElse(null)
+                : repos.findByName(cleanName).stream().findFirst().orElse(null);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+        if (repo.getOwner().getId().equals(principal.getId())) {
+            return ResponseEntity.badRequest().body(Map.of("error", "You already own this repository"));
+        }
+
+        User requester = users.findById(principal.getId()).orElseThrow();
+        String msg = body != null && body.get("message") != null && !body.get("message").isBlank()
+                ? body.get("message").trim()
+                : "Requesting collaborator access to @" + repo.getOwner().getUsername() + "/" + repo.getName();
+
+        RepoAccessRequest req = accessRequests
+                .findByRepositoryIdAndRequesterIdAndStatus(repo.getId(), requester.getId(), "PENDING")
+                .orElse(new RepoAccessRequest(repo, requester, msg));
+        req.setMessage(msg);
+        RepoAccessRequest saved = accessRequests.save(req);
+
+        return ResponseEntity.ok(Map.of(
+                "id", saved.getId(),
+                "status", saved.getStatus(),
+                "message", "Access request sent to @" + repo.getOwner().getUsername()
+        ));
+    }
+
+    /**
+     * Owner approves or denies an incoming access request.
+     */
+    @Transactional
+    @PostMapping(value = "/api/access-requests/{id}/respond", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> respondToAccessRequest(
+            @PathVariable Long id,
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody Map<String, String> body
+    ) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
+        }
+        RepoAccessRequest req = accessRequests.findById(id).orElse(null);
+        if (req == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Access request not found"));
+        }
+        if (!req.getRepository().getOwner().getId().equals(principal.getId())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Only repository owner can respond"));
+        }
+        String action = body != null && body.get("status") != null ? body.get("status").trim().toUpperCase() : "APPROVED";
+        if (!"APPROVED".equals(action) && !"DENIED".equals(action)) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Status must be APPROVED or DENIED"));
+        }
+        req.setStatus(action);
+        accessRequests.save(req);
+        return ResponseEntity.ok(Map.of("id", req.getId(), "status", req.getStatus()));
     }
 }

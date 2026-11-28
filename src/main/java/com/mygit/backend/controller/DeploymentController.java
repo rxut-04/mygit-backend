@@ -825,10 +825,17 @@ public class DeploymentController {
 
     @Transactional(readOnly = true)
     @GetMapping(value = "/api/deployments/{id}/logs", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<?> getDeploymentLogs(@PathVariable Long id) {
+    public ResponseEntity<?> getDeploymentLogs(
+            @PathVariable Long id,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
         Deployment dep = deployments.findById(id).orElse(null);
         if (dep == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Deployment not found"));
+        }
+        if (dep.getRepository().isPrivate()
+                && (principal == null || !dep.getRepository().getOwner().getId().equals(principal.getId()))) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Repository is private"));
         }
         List<Map<String, Object>> logs = deploymentLogs.findByDeploymentIdOrderBySeqAsc(id)
                 .stream().map(this::toLogMap).toList();
@@ -979,11 +986,15 @@ public class DeploymentController {
 
     @Transactional(readOnly = true)
     @GetMapping(value = "/api/deployments/{id}/logs/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamDeploymentLogs(@PathVariable Long id) {
+    public SseEmitter streamDeploymentLogs(
+            @PathVariable Long id,
+            @AuthenticationPrincipal CustomUser principal
+    ) {
         SseEmitter emitter = new SseEmitter(300000L);
         try {
             Deployment dep = deployments.findById(id).orElse(null);
-            if (dep == null) {
+            if (dep == null || (dep.getRepository().isPrivate()
+                    && (principal == null || !dep.getRepository().getOwner().getId().equals(principal.getId())))) {
                 emitter.complete();
                 return emitter;
             }
