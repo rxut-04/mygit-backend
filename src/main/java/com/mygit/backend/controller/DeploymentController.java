@@ -93,7 +93,9 @@ public class DeploymentController {
     }
 
     /**
-     * Auto-deploys on push if the repository already has a deployment or a static/prebuilt entry point on main.
+     * Auto-deploys on push only if the repository already has a deployment or has a root web entry point
+     * (index.html, dist/index.html, build/index.html, or out/index.html) on main.
+     * Non-web repositories (Java, Python, C++, etc.) can be pushed freely without triggering failed deployments.
      */
     @Transactional
     public void autoDeployIfEligible(Repository repo, String branch) {
@@ -103,11 +105,14 @@ public class DeploymentController {
         if (!hasExisting && !"main".equalsIgnoreCase(targetBranch)) return;
 
         List<RepositoryFile> repoFiles = files.findByRepositoryIdAndBranchName(repo.getId(), targetBranch);
-        boolean looksWeb = repoFiles.stream().anyMatch(f -> {
+        boolean hasRootWebEntry = repoFiles.stream().anyMatch(f -> {
             String p = f.getFilePath().toLowerCase();
-            return p.endsWith("index.html") || p.endsWith("package.json");
+            return p.equals("index.html")
+                    || p.equals("dist/index.html")
+                    || p.equals("build/index.html")
+                    || p.equals("out/index.html");
         });
-        if (hasExisting || looksWeb) {
+        if (hasExisting || hasRootWebEntry) {
             executeDeployment(repo, targetBranch, true);
         }
     }
@@ -312,13 +317,11 @@ public class DeploymentController {
         }
 
         Map<String, RepositoryFile> byLowerPath = new LinkedHashMap<>();
-        List<RepositoryFile> htmlFiles = new ArrayList<>();
         List<RepositoryFile> pkgFiles = new ArrayList<>();
         for (RepositoryFile f : repoFiles) {
             String lp = f.getFilePath().toLowerCase();
             byLowerPath.put(lp, f);
-            if (lp.endsWith(".html") || lp.endsWith(".htm")) htmlFiles.add(f);
-            if (lp.equals("package.json") || lp.endsWith("/package.json")) pkgFiles.add(f);
+            if (lp.equals("package.json")) pkgFiles.add(f);
         }
 
         String detectedFramework = "unknown";
@@ -326,95 +329,48 @@ public class DeploymentController {
         String entryFile = "index.html";
         String errorSummary = null;
 
-        // 1. Check standard & nested prebuilt output directories first (dist/, build/, out/)
+        // 1. Check root prebuilt output directories first (dist/, build/, out/)
         RepositoryFile prebuilt = findFirstMatching(byLowerPath, List.of(
                 "dist/index.html", "build/index.html", "out/index.html"
         ));
-        if (prebuilt == null) {
-            for (RepositoryFile hf : htmlFiles) {
-                String lp = hf.getFilePath().toLowerCase();
-                if (lp.endsWith("/dist/index.html") || lp.endsWith("/build/index.html") || lp.endsWith("/out/index.html")) {
-                    prebuilt = hf;
-                    break;
-                }
-            }
-        }
 
         if (prebuilt != null) {
-            detectedFramework = prebuilt.getFilePath().toLowerCase().contains("out/") ? "nextjs-export" : "prebuilt-spa";
+            detectedFramework = prebuilt.getFilePath().toLowerCase().startsWith("out/") ? "nextjs-export" : "prebuilt-spa";
             outputDir = parentDir(prebuilt.getFilePath());
             entryFile = fileNameOnly(prebuilt.getFilePath());
             logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
                     "Detected pre-built bundle at '" + prebuilt.getFilePath() + "'.")));
-        } else if (byLowerPath.containsKey("index.html") && pkgFiles.isEmpty()) {
-            detectedFramework = "static";
-            outputDir = "";
-            entryFile = "index.html";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected static HTML entry point at index.html.")));
-        } else if (byLowerPath.containsKey("docs/index.html") && pkgFiles.isEmpty()) {
-            detectedFramework = "static";
-            outputDir = "docs";
-            entryFile = "index.html";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected static HTML entry point at docs/index.html.")));
-        } else if (byLowerPath.containsKey("public/index.html") && pkgFiles.isEmpty()) {
-            detectedFramework = "static";
-            outputDir = "public";
-            entryFile = "index.html";
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO", "Detected static HTML entry point at public/index.html.")));
-        } else {
-            // Ambiguous / nested / custom HTML / unbuilt JS project -> invoke OpenRouter AI Project Detector
-            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                    "Running AI Project Detector (OpenRouter) across " + repoFiles.size() + " files...")));
-
-            AiDetectionResult ai = detectProjectWithAi(repo, repoFiles, pkgFiles);
-            if (ai != null) {
-                detectedFramework = ai.framework;
-                logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, ai.deployable ? "INFO" : "WARN",
-                        "AI Detector (" + ai.model + "): " + ai.reason)));
-                if (ai.deployable && ai.entryFile != null && !ai.entryFile.isBlank()) {
-                    String candidateFull = (ai.outputDir != null && !ai.outputDir.isBlank())
-                            ? ai.outputDir.replaceAll("/+$", "") + "/" + ai.entryFile
-                            : ai.entryFile;
-                    RepositoryFile resolved = byLowerPath.get(candidateFull.toLowerCase());
-                    if (resolved != null) {
-                        outputDir = parentDir(resolved.getFilePath());
-                        entryFile = fileNameOnly(resolved.getFilePath());
-                        logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                                "Resolved entry file '" + resolved.getFilePath() + "' (outputDir: '" + outputDir + "').")));
-                    } else {
-                        errorSummary = "AI detector suggested '" + candidateFull + "', which does not exist in branch '" + branch + "'.";
-                        logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
-                    }
-                } else {
-                    errorSummary = ai.reason;
-                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
-                }
+        } else if (byLowerPath.containsKey("index.html")) {
+            RepositoryFile rootIndex = byLowerPath.get("index.html");
+            String rootHtml = new String(resolveRawFileBytes(repo, rootIndex), StandardCharsets.UTF_8);
+            boolean hasUnbuiltModuleEntry = rootHtml.matches("(?is).*<script[^>]+src=[\"'][^\"']*\\.(tsx|ts|jsx)[\"'][^>]*>.*");
+            if (hasUnbuiltModuleEntry) {
+                detectedFramework = !pkgFiles.isEmpty() ? "vite" : "react";
+                errorSummary = "Root index.html references an uncompiled source entry (.ts/.tsx/.jsx) and no dist/, build/, or out/ bundle was found. "
+                        + "Run 'npm run build' locally and push the generated dist/ folder so mygit Pages can serve it.";
+                logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
             } else {
-                // Deterministic fallback if OpenRouter key is missing or unreachable
-                if (!pkgFiles.isEmpty()) {
-                    RepositoryFile pkgFile = pkgFiles.get(0);
-                    String pkg = pkgFile.getContentText() != null ? pkgFile.getContentText().toLowerCase() : "";
-                    if (pkg.contains("\"vite\"")) detectedFramework = "vite";
-                    else if (pkg.contains("\"next\"")) detectedFramework = "nextjs";
-                    else if (pkg.contains("\"react-scripts\"") || pkg.contains("\"react\"")) detectedFramework = "react";
-                    else detectedFramework = "node";
-
-                    errorSummary = "Detected unbuilt " + detectedFramework.toUpperCase()
-                            + " project (" + pkgFile.getFilePath() + ") without a compiled dist/, build/, or out/ folder. "
-                            + "Run 'npm run build' locally and push the generated dist/ folder so mygit Pages can serve it.";
-                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
-                } else if (htmlFiles.size() == 1) {
-                    RepositoryFile onlyHtml = htmlFiles.get(0);
-                    detectedFramework = "static";
-                    outputDir = parentDir(onlyHtml.getFilePath());
-                    entryFile = fileNameOnly(onlyHtml.getFilePath());
-                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
-                            "Auto-selected single HTML entry point '" + onlyHtml.getFilePath() + "'.")));
-                } else {
-                    errorSummary = "No web entry point (index.html) found in root, public/, docs/, dist/, build/, or out/. Add an index.html file to deploy.";
-                    logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
-                }
+                detectedFramework = "static";
+                outputDir = "";
+                entryFile = "index.html";
+                logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "INFO",
+                        "Detected project root entry point at 'index.html'.")));
             }
+        } else {
+            if (!pkgFiles.isEmpty()) {
+                RepositoryFile pkgFile = pkgFiles.get(0);
+                String pkg = pkgFile.getContentText() != null ? pkgFile.getContentText().toLowerCase() : "";
+                if (pkg.contains("\"vite\"")) detectedFramework = "vite";
+                else if (pkg.contains("\"next\"")) detectedFramework = "nextjs";
+                else if (pkg.contains("\"react-scripts\"") || pkg.contains("\"react\"")) detectedFramework = "react";
+                else detectedFramework = "node";
+
+                errorSummary = "No root index.html or compiled dist/index.html, build/index.html, or out/index.html found for this "
+                        + detectedFramework.toUpperCase() + " repository. Run 'npm run build' and push dist/ (or add a root index.html) to deploy.";
+            } else {
+                errorSummary = "No index.html found in project root (checked index.html, dist/index.html, build/index.html, out/index.html).";
+            }
+            logs.add(deploymentLogs.save(new DeploymentLog(dep, seq++, "ERROR", errorSummary)));
         }
 
         dep.setFramework(detectedFramework);
