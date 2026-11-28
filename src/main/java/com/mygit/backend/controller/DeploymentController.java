@@ -28,6 +28,8 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.InflaterInputStream;
 
@@ -43,6 +45,7 @@ public class DeploymentController {
     @Autowired private UserRepository users;
 
     private final ObjectMapper mapper = new ObjectMapper();
+    private final Map<Long, CopyOnWriteArrayList<SseEmitter>> liveEmitters = new ConcurrentHashMap<>();
 
     private Repository resolveRepository(String name, String owner, CustomUser principal) {
         String cleanName = name.endsWith(".git") ? name.substring(0, name.length() - 4) : name;
@@ -853,10 +856,149 @@ public class DeploymentController {
         ));
     }
 
+    @Transactional
+    @PostMapping(value = {
+            "/api/repos/{name}/deployments/start",
+            "/api/repos/{owner}/{name}/deployments/start"
+    }, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> startCliDeployment(
+            @PathVariable String name,
+            @PathVariable(required = false) String owner,
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody(required = false) Map<String, String> body
+    ) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
+        }
+        Repository repo = resolveRepository(name, owner, principal);
+        if (repo == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Repository not found"));
+        }
+        if (!repo.getOwner().getId().equals(principal.getId())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Only repository owner can deploy"));
+        }
+
+        String branch = (body != null && body.get("branch") != null && !body.get("branch").isBlank()) ? body.get("branch") : "main";
+        String framework = (body != null && body.get("framework") != null && !body.get("framework").isBlank()) ? body.get("framework") : "vite";
+        String commitSha = (body != null && body.get("commitSha") != null) ? body.get("commitSha") : null;
+
+        Deployment dep = new Deployment(repo, branch, commitSha);
+        dep.setStatus("BUILDING");
+        dep.setFramework(framework);
+        dep = deployments.save(dep);
+
+        DeploymentLog initLog = deploymentLogs.save(new DeploymentLog(
+                dep, 1, "INFO", "Started live CLI deployment for " + repo.getOwner().getUsername() + "/" + repo.getName() + " (" + branch + ")"
+        ));
+
+        return ResponseEntity.ok(Map.of(
+                "deployment", toDeploymentMap(dep),
+                "logs", List.of(toLogMap(initLog))
+        ));
+    }
+
+    @Transactional
+    @PostMapping(value = "/api/deployments/{id}/logs", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> appendDeploymentLogs(
+            @PathVariable Long id,
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody Map<String, Object> body
+    ) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
+        }
+        Deployment dep = deployments.findById(id).orElse(null);
+        if (dep == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Deployment not found"));
+        }
+        if (!dep.getRepository().getOwner().getId().equals(principal.getId())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Forbidden"));
+        }
+
+        List<DeploymentLog> existing = deploymentLogs.findByDeploymentIdOrderBySeqAsc(id);
+        int nextSeq = existing.isEmpty() ? 1 : existing.get(existing.size() - 1).getSeq() + 1;
+
+        Object rawLines = body.get("lines");
+        List<DeploymentLog> saved = new ArrayList<>();
+        if (rawLines instanceof List<?> list) {
+            for (Object item : list) {
+                if (item instanceof Map<?, ?> m) {
+                    String level = m.get("level") != null ? String.valueOf(m.get("level")) : "INFO";
+                    String msg = m.get("message") != null ? String.valueOf(m.get("message")) : "";
+                    if (!msg.isBlank()) {
+                        saved.add(new DeploymentLog(dep, nextSeq++, level, msg));
+                    }
+                }
+            }
+        }
+        if (!saved.isEmpty()) {
+            saved = deploymentLogs.saveAll(saved);
+            CopyOnWriteArrayList<SseEmitter> emitters = liveEmitters.get(id);
+            if (emitters != null) {
+                for (DeploymentLog l : saved) {
+                    Map<String, Object> logMap = toLogMap(l);
+                    for (SseEmitter em : emitters) {
+                        try {
+                            em.send(SseEmitter.event().name("log").data(logMap));
+                        } catch (Exception ex) {
+                            emitters.remove(em);
+                        }
+                    }
+                }
+            }
+        }
+        return ResponseEntity.ok(Map.of("appended", saved.size()));
+    }
+
+    @Transactional
+    @PostMapping(value = "/api/deployments/{id}/finish", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> finishCliDeployment(
+            @PathVariable Long id,
+            @AuthenticationPrincipal CustomUser principal,
+            @RequestBody Map<String, Object> body
+    ) {
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Authentication required"));
+        }
+        Deployment dep = deployments.findById(id).orElse(null);
+        if (dep == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Deployment not found"));
+        }
+        if (!dep.getRepository().getOwner().getId().equals(principal.getId())) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", "Forbidden"));
+        }
+
+        String status = body.get("status") != null ? String.valueOf(body.get("status")).toUpperCase() : "LIVE";
+        if (body.get("framework") != null) dep.setFramework(String.valueOf(body.get("framework")));
+        if (body.get("outputDir") != null) dep.setOutputDir(String.valueOf(body.get("outputDir")));
+        if (body.get("entryFile") != null) dep.setEntryFile(String.valueOf(body.get("entryFile")));
+        if (body.get("errorSummary") != null) dep.setErrorSummary(String.valueOf(body.get("errorSummary")));
+        if (body.get("durationMs") instanceof Number n) dep.setDurationMs(n.longValue());
+
+        dep.setStatus(status);
+        if ("LIVE".equals(status)) {
+            dep.setLiveUrl("/pages/" + dep.getRepository().getOwner().getUsername() + "/" + dep.getRepository().getName() + "/");
+        }
+        dep.setFinishedAt(LocalDateTime.now());
+        dep = deployments.save(dep);
+
+        Map<String, Object> depMap = toDeploymentMap(dep);
+        CopyOnWriteArrayList<SseEmitter> emitters = liveEmitters.remove(id);
+        if (emitters != null) {
+            for (SseEmitter em : emitters) {
+                try {
+                    em.send(SseEmitter.event().name("status").data(depMap));
+                    em.complete();
+                } catch (Exception ignored) {}
+            }
+        }
+        return ResponseEntity.ok(Map.of("deployment", depMap));
+    }
+
     @Transactional(readOnly = true)
     @GetMapping(value = "/api/deployments/{id}/logs/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter streamDeploymentLogs(@PathVariable Long id) {
-        SseEmitter emitter = new SseEmitter(15000L);
+        SseEmitter emitter = new SseEmitter(300000L);
         try {
             Deployment dep = deployments.findById(id).orElse(null);
             if (dep == null) {
@@ -867,8 +1009,16 @@ public class DeploymentController {
             for (DeploymentLog l : logs) {
                 emitter.send(SseEmitter.event().name("log").data(toLogMap(l)));
             }
-            emitter.send(SseEmitter.event().name("status").data(toDeploymentMap(dep)));
-            emitter.complete();
+            if ("BUILDING".equalsIgnoreCase(dep.getStatus()) || "PENDING".equalsIgnoreCase(dep.getStatus())) {
+                CopyOnWriteArrayList<SseEmitter> list = liveEmitters.computeIfAbsent(id, k -> new CopyOnWriteArrayList<>());
+                list.add(emitter);
+                emitter.onCompletion(() -> list.remove(emitter));
+                emitter.onTimeout(() -> list.remove(emitter));
+                emitter.onError(e -> list.remove(emitter));
+            } else {
+                emitter.send(SseEmitter.event().name("status").data(toDeploymentMap(dep)));
+                emitter.complete();
+            }
         } catch (Exception e) {
             emitter.completeWithError(e);
         }
